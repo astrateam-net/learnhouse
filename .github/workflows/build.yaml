@@ -1,0 +1,149 @@
+---
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: Build
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    name: Changes
+    runs-on: ubuntu-latest
+    # A job block replaces the workflow's, so contents is repeated.
+    permissions:
+      contents: read # actions/checkout
+      pull-requests: read # paths-filter reads the PR file list over the API
+    outputs:
+      ci: ${{ steps.filter.outputs.ci }}
+      series: ${{ steps.filter.outputs.series }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dorny/paths-filter@7b450fff21473bca461d4b92ce414b9d0420d706 # v4.0.2
+        id: filter
+        # No docs filter: the lint job below is deliberately unfiltered.
+        with:
+          filters: |
+            ci:
+              - ".github/workflows/**"
+              - ".mise/**"
+              - "mise.toml"
+              - "mise.lock"
+              - "test/**"
+            series:
+              - "lib/**"
+              - "patches/**"
+              - "apps/**"
+              - "docker-bake.hcl"
+              - "tests.yaml"
+
+  # Squash merges take the PR title as the commit subject, so it is the only message that reaches
+  # main and no git hook sees it. Same commit-msg hook hk.pkl runs locally.
+  title:
+    name: PR title
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+      # The title is attacker-controlled: it reaches the shell as an env var, never as `${{ }}`.
+      - env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          printf '%s\n' "$TITLE" > "$RUNNER_TEMP/pr-title"
+          hk run commit-msg "$RUNNER_TEMP/pr-title"
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    # No filter and no submodule: flint's scope is every tracked file, so any path list here would
+    # silently shrink it.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+      - run: mise run lint
+
+  series:
+    name: Patch series integrity
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.series == 'true' || needs.changes.outputs.ci == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+      # quilt is in neither the mise registry nor the pkgx pantry; apt is the only source for it.
+      - uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
+        with:
+          packages: quilt
+          version: 1.0
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+      - run: mise run test:series
+
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+    needs: [changes, series]
+    if: needs.changes.outputs.series == 'true' || needs.changes.outputs.ci == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+          persist-credentials: false
+      - uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
+        with:
+          packages: quilt
+          version: 1.0
+      - uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+      # Before the install, so the lockfile resolves against the manifests the series produced.
+      - run: mise run up
+      - name: Install LearnHouse's web dependencies
+        working-directory: lib/learnhouse/apps/web
+        run: mise exec -- bun install --frozen-lockfile
+      - name: Install LearnHouse's API dependencies
+        working-directory: lib/learnhouse/apps/api
+        run: mise exec -- uv sync --frozen
+      # Upstream's own PR gates on what we touch, so every patch stays upstreamable.
+      - run: mise run lint:upstream
+      - run: mise run test:unit
+
+  # Builds and runs tests.yaml without publishing; release.yaml publishes.
+  image:
+    name: Image
+    needs: [changes, series]
+    if: needs.changes.outputs.series == 'true' || needs.changes.outputs.ci == 'true'
+    # `$/` is what zizmor's self-repository audit asks for, but actionlint 1.7.12 rejects it.
+    uses: ./.github/workflows/image.yaml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      packages: read
+    with:
+      release: false
+
+  # The only required check. `changes` is in needs on purpose: without it, a failure there skips
+  # the rest and skipped alone would read as green.
+  gate:
+    name: Gate
+    runs-on: ubuntu-latest
+    needs: [changes, title, lint, series, tests, image]
+    if: always()
+    steps:
+      - name: A job failed or was cancelled
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1

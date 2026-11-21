@@ -1,0 +1,3 @@
+[submodule "lib/learnhouse"]
+	path = lib/learnhouse
+	url = https://github.com/learnhouse/learnhouse

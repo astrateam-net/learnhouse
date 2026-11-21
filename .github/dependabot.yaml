@@ -1,0 +1,11 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    commit-message:
+      prefix: "chore"
+
+  # The Dekart submodule is deliberately NOT listed: a bot would move the pointer
+  # and leave the series broken.

@@ -1,0 +1,817 @@
+feat(web): Kinescope as a video activity source
+
+The video activity offers Upload and YouTube only. A Kinescope video can be
+iframed through an Embed activity, but then LearnHouse records no progress:
+no video_progress milestones, no completion, no timestamped notes.
+
+Add Kinescope next to Upload and YouTube in the create dialog. The activity is
+stored as an external video with type "kinescope" (accepted by the API), and
+the player is chosen by link, so an activity edited from a YouTube to a
+Kinescope URL plays correctly. KinescopePlayer (new) drives Kinescope's IFrame
+Player API (player.kinescope.io/latest/iframe.player.js, loaded on demand) the
+way the YouTube branch drives react-youtube: progress milestones and completion
+through useVideoProgress, the notes clock through registerVideoClock, and the
+activity's start/end, autoplay and mute settings. The edit dialog labels a
+Kinescope link as such. New strings are translated in every locale.
+
+Covered by `kinescope.test.mjs` (which links play in the Kinescope player and
+which URL the player API is given); the dialogs keep passing
+`activity-create-modals.test.mjs`.
+Index: b/lib/learnhouse/apps/web/components/Objects/Activities/Video/Video.tsx
+===================================================================
+--- a/lib/learnhouse/apps/web/components/Objects/Activities/Video/Video.tsx
++++ b/lib/learnhouse/apps/web/components/Objects/Activities/Video/Video.tsx
+@@ -7,6 +7,8 @@ import { getUriWithOrg } from '@services
+ import { getCourseThumbnailMediaDirectory } from '@services/media/media'
+ import LearnHousePlayer, { type PlayerNavItem } from './LearnHousePlayer'
+ import YouTubeFacade from './YouTubeFacade'
++import KinescopePlayer from './KinescopePlayer'
++import { kinescopeVideoUrl } from '@/lib/media/kinescope'
+ import VideoChapters from './VideoChapters'
+ import { positiveIntParam } from '@/lib/copilot/sources'
+ import { useVideoProgress } from '@services/analytics/useVideoProgress'
+@@ -88,6 +90,8 @@ function VideoActivity({ activity, cours
+   // markup depends on it, so reading the URL during render is hydration-safe.
+   const linkedStart = typeof window !== 'undefined' ? positiveIntParam(window.location.search, 't') : null
+   const details = linkedStart ? { ...activity.details, startTime: linkedStart } : activity.details
++  // External videos share one sub-type; the link says which player to use.
++  const kinescopeUrl = kinescopeVideoUrl(activity.content?.uri)
+ 
+   // Org analytics: video_progress at 25/50/75/100%.
+   const { report: reportProgress, complete: completeProgress } = useVideoProgress(
+@@ -275,7 +279,30 @@ function VideoActivity({ activity, cours
+               )}
+             </div>
+           )}
+-          {activity.activity_sub_type === 'SUBTYPE_VIDEO_YOUTUBE' && (
++          {activity.activity_sub_type === 'SUBTYPE_VIDEO_YOUTUBE' && kinescopeUrl && (
++            <div className="w-full">
++              <div className="lh-video-frame relative w-full aspect-video overflow-hidden rounded-[20px] ring-1 ring-white/10 max-sm:rounded-none max-sm:ring-0">
++                <KinescopePlayer
++                  url={kinescopeUrl}
++                  title={activity.name}
++                  autoplay={!!details?.autoplay}
++                  muted={!!details?.muted}
++                  startTime={details?.startTime || 0}
++                  endTime={details?.endTime || null}
++                  onProgress={reportProgress}
++                  onEnded={completeProgress}
++                  onPlayer={(player) => {
++                    youtubeClockOff.current?.()
++                    youtubeClockOff.current = registerVideoClock({
++                      getTime: () => Promise.resolve(player?.getCurrentTime?.()).then((v) => (Number.isFinite(Number(v)) ? Number(v) : null)).catch(() => null),
++                      seek: (s) => player?.seekTo?.(s),
++                    })
++                  }}
++                />
++              </div>
++            </div>
++          )}
++          {activity.activity_sub_type === 'SUBTYPE_VIDEO_YOUTUBE' && !kinescopeUrl && (
+             <div className="w-full">
+               <div className="lh-video-frame relative w-full aspect-video overflow-hidden rounded-[20px] ring-1 ring-white/10 max-sm:rounded-none max-sm:ring-0">
+                 <YouTubeFacade
+Index: b/lib/learnhouse/apps/web/components/Objects/Modals/Activities/Create/NewActivityModal/VideoActivityModal.tsx
+===================================================================
+--- a/lib/learnhouse/apps/web/components/Objects/Modals/Activities/Create/NewActivityModal/VideoActivityModal.tsx
++++ b/lib/learnhouse/apps/web/components/Objects/Modals/Activities/Create/NewActivityModal/VideoActivityModal.tsx
+@@ -1,6 +1,6 @@
+ import React, { useState } from 'react'
+ import { useTranslation } from 'react-i18next'
+-import { CaretDown, UploadSimple, YoutubeLogo } from '@phosphor-icons/react'
++import { CaretDown, FilmStrip, UploadSimple, YoutubeLogo } from '@phosphor-icons/react'
+ import { constructAcceptValue } from '@/lib/constants'
+ import CaptionsSettings, {
+   type CaptionsValue,
+@@ -41,7 +41,7 @@ function VideoModal({
+   const [isSubmitting, setIsSubmitting] = useState(false)
+   const [name, setName] = useState('')
+   const [youtubeUrl, setYoutubeUrl] = useState('')
+-  const [source, setSource] = useState<'file' | 'youtube'>('file')
++  const [source, setSource] = useState<'file' | 'youtube' | 'kinescope'>('file')
+   const [showPlayback, setShowPlayback] = useState(false)
+   const [videoDetails, setVideoDetails] = useState<VideoDetails>({
+     startTime: 0,
+@@ -87,10 +87,10 @@ function VideoModal({
+         )
+       }
+ 
+-      if (source === 'youtube') {
++      if (source === 'youtube' || source === 'kinescope') {
+         const external_video_object: ExternalVideoObject = {
+           name: name.trim(),
+-          type: 'youtube',
++          type: source,
+           uri: youtubeUrl.trim(),
+           chapter_id: chapterId,
+           details: videoDetails,
+@@ -168,6 +168,7 @@ function VideoModal({
+             options={[
+               { key: 'file', label: <><UploadSimple size={13} />{t('media.upload')}</> },
+               { key: 'youtube', label: <><YoutubeLogo size={13} />YouTube</> },
++              { key: 'kinescope', label: <><FilmStrip size={13} />Kinescope</> },
+             ]}
+           />
+         }
+@@ -187,8 +188,8 @@ function VideoModal({
+             onChange={(e) => setYoutubeUrl(e.target.value)}
+             type="url"
+             required
+-            aria-label={t('activities.modal.youtube_url')}
+-            placeholder="https://youtube.com/watch?v=..."
++            aria-label={source === 'kinescope' ? t('activities.modal.kinescope_url') : t('activities.modal.youtube_url')}
++            placeholder={source === 'kinescope' ? 'https://kinescope.io/...' : 'https://youtube.com/watch?v=...'}
+             className={INPUT}
+           />
+         )}
+Index: b/lib/learnhouse/apps/web/components/Objects/Modals/Activities/Edit/EditVideoActivityModal.tsx
+===================================================================
+--- a/lib/learnhouse/apps/web/components/Objects/Modals/Activities/Edit/EditVideoActivityModal.tsx
++++ b/lib/learnhouse/apps/web/components/Objects/Modals/Activities/Edit/EditVideoActivityModal.tsx
+@@ -3,7 +3,7 @@ import React, { useEffect, useState } fr
+ import { CreditsIcon } from '@components/Objects/AI/CreditCost'
+ import { useAICreditPrices } from '@components/Hooks/useAICredits'
+ import BarLoader from 'react-spinners/BarLoader'
+-import { YoutubeLogo } from '@phosphor-icons/react'
++import { FilmStrip, YoutubeLogo } from '@phosphor-icons/react'
+ import { AIButton } from '@components/Objects/AI/AIBrand'
+ import { constructAcceptValue } from '@/lib/constants'
+ import CaptionsSettings, {
+@@ -23,6 +23,7 @@ import { mutate } from 'swr'
+ import { useTranslation } from 'react-i18next'
+ import { Button, INPUT } from '@components/Dashboard/Shared/DashKit/DashKit'
+ import { FilePicker, ModalFormActions, useModalFormId } from '../activityFormKit'
++import { isKinescopeUrl } from '@/lib/media/kinescope'
+ 
+ const SUPPORTED_FILES = constructAcceptValue(['mp4', 'webm'])
+ 
+@@ -50,6 +51,7 @@ function EditVideoActivityModal({ activi
+ 
+   const [name, setName] = useState(activity.name || '')
+   const [youtubeUrl, setYoutubeUrl] = useState('')
++  const isKinescope = isKinescopeUrl(youtubeUrl)
+   const [videoFile, setVideoFile] = useState<File | null>(null)
+   const [videoDetails, setVideoDetails] = useState<VideoDetails>({
+     startTime: 0,
+@@ -204,17 +206,19 @@ function EditVideoActivityModal({ activi
+ 
+         {isYouTube ? (
+           <div className="space-y-1.5">
+-            <label className="text-sm font-semibold text-neutral-800">{t('activities.modal.youtube_url')}</label>
++            <label className="text-sm font-semibold text-neutral-800">
++              {isKinescope ? t('activities.modal.kinescope_url') : t('activities.modal.youtube_url')}
++            </label>
+             <div className="flex items-center gap-2 text-xs text-neutral-400 mb-1">
+-              <YoutubeLogo size={14} weight="duotone" />
+-              <span>{t('activities.edit_modal.update_youtube_hint')}</span>
++              {isKinescope ? <FilmStrip size={14} weight="duotone" /> : <YoutubeLogo size={14} weight="duotone" />}
++              <span>{isKinescope ? t('activities.edit_modal.update_kinescope_hint') : t('activities.edit_modal.update_youtube_hint')}</span>
+             </div>
+             <input
+               value={youtubeUrl}
+               onChange={(e) => setYoutubeUrl(e.target.value)}
+               type="text"
+               required
+-              placeholder="https://youtube.com/watch?v=..."
++              placeholder={isKinescope ? 'https://kinescope.io/...' : 'https://youtube.com/watch?v=...'}
+               className={INPUT}
+             />
+           </div>
+Index: b/lib/learnhouse/apps/web/locales/ar.json
+===================================================================
+--- a/lib/learnhouse/apps/web/locales/ar.json
++++ b/lib/learnhouse/apps/web/locales/ar.json
+@@ -4058,6 +4058,7 @@
+       "source": "المصدر",
+       "video_file": "ملف فيديو",
+       "youtube_url": "رابط YouTube",
++      "kinescope_url": "رابط Kinescope",
+       "video_settings": "إعدادات الفيديو",
+       "start_time": "وقت البدء",
+       "end_time_optional": "وقت الانتهاء (اختياري)",
+@@ -4080,6 +4081,7 @@
+       "youtube_video": "فيديو YouTube",
+       "hosted_video": "فيديو مستضاف",
+       "update_youtube_hint": "حدّث رابط YouTube أدناه",
++      "update_kinescope_hint": "حدّث رابط Kinescope أدناه",
+       "replace_video": "استبدال ملف الفيديو",
+       "keep_current_video": "اتركه فارغًا للاحتفاظ بالفيديو الحالي",
+       "saving_captions": "جارٍ حفظ إعدادات الترجمة النصية...",
+@@ -7020,7 +7022,7 @@
+           "markdown": "اعرض ملف Markdown من رابط، مثل README على GitHub.",
+           "resource": "أعد استخدام ملف أو صفحة من مكتبتك.",
+           "scorm": "استورد حزمة SCORM أُنشئت في أداة أخرى.",
+-          "video": "ارفع ملف فيديو أو اربط فيديو من YouTube."
++          "video": "ارفع ملف فيديو أو اربط فيديو من YouTube أو Kinescope."
+         },
+         "certification": {
+           "remove_confirm": "إيقاف",
+Index: b/lib/learnhouse/apps/web/locales/bn.json
+===================================================================
+--- a/lib/learnhouse/apps/web/locales/bn.json
++++ b/lib/learnhouse/apps/web/locales/bn.json
+@@ -3774,6 +3774,7 @@
+       "source": "সোর্স",
+       "video_file": "ভিডিও ফাইল",
+       "youtube_url": "YouTube URL",
++      "kinescope_url": "Kinescope URL",
+       "video_settings": "ভিডিও সেটিংস",
+       "start_time": "শুরুর সময়",
+       "end_time_optional": "শেষের সময় (ঐচ্ছিক)",
+@@ -3796,6 +3797,7 @@
+       "youtube_video": "YouTube ভিডিও",
+       "hosted_video": "হোস্ট করা ভিডিও",
+       "update_youtube_hint": "নিচের YouTube লিঙ্কটি আপডেট করুন",
++      "update_kinescope_hint": "নিচের Kinescope লিঙ্কটি আপডেট করুন",
+       "replace_video": "ভিডিও ফাইল পরিবর্তন করুন",
+       "keep_current_video": "বর্তমান ভিডিও রাখতে ফাঁকা রাখুন",
+       "saving_captions": "ক্যাপশন সেটিংস সংরক্ষণ হচ্ছে...",
+@@ -6592,7 +6594,7 @@
+           "markdown": "GitHub README-র মতো কোনো URL থেকে একটি Markdown ফাইল দেখান।",
+           "resource": "আপনার লাইব্রেরি থেকে কোনো ফাইল বা পেজ আবার ব্যবহার করুন।",
+           "scorm": "অন্য টুলে তৈরি SCORM প্যাকেজ ইমপোর্ট করুন।",
+-          "video": "ভিডিও ফাইল আপলোড করুন বা YouTube ভিডিও লিংক করুন।"
++          "video": "ভিডিও ফাইল আপলোড করুন বা YouTube অথবা Kinescope ভিডিও লিংক করুন।"
+         },
+         "certification": {
+           "remove_confirm": "বন্ধ করুন",
+Index: b/lib/learnhouse/apps/web/locales/de.json
+===================================================================
+--- a/lib/learnhouse/apps/web/locales/de.json
++++ b/lib/learnhouse/apps/web/locales/de.json
+@@ -3774,6 +3774,7 @@
+       "source": "Quelle",
+       "video_file": "Videodatei",
+       "youtube_url": "YouTube-URL",
++      "kinescope_url": "Kinescope-URL",
+       "video_settings": "Videoeinstellungen",
+       "start_time": "Startzeit",
+       "end_time_optional": "Endzeit (optional)",
+@@ -3796,6 +3797,7 @@
+       "youtube_video": "YouTube-Video",
+       "hosted_video": "Gehostetes Video",
+       "update_youtube_hint": "Aktualisieren Sie unten den YouTube-Link",
++      "update_kinescope_hint": "Aktualisieren Sie unten den Kinescope-Link",
+       "replace_video": "Videodatei ersetzen",
+       "keep_current_video": "Leer lassen, um das aktuelle Video beizubehalten",
+       "saving_captions": "Untertiteleinstellungen werden gespeichert...",
+@@ -6592,7 +6594,7 @@
+           "markdown": "Zeige eine Markdown-Datei von einer URL an, etwa eine GitHub-README.",
+           "resource": "Verwende eine Datei oder Seite aus deiner Bibliothek erneut.",
+           "scorm": "Importiere ein SCORM-Paket, das in einem anderen Tool erstellt wurde.",
+-          "video": "Lade eine Videodatei hoch oder verlinke ein YouTube-Video."
++          "video": "Lade eine Videodatei hoch oder verlinke ein YouTube- oder Kinescope-Video."
+         },
+         "certification": {
+           "remove_confirm": "Deaktivieren",
+Index: b/lib/learnhouse/apps/web/locales/en.json
+===================================================================
+--- a/lib/learnhouse/apps/web/locales/en.json
++++ b/lib/learnhouse/apps/web/locales/en.json
+@@ -3770,6 +3770,7 @@
+       "source": "Source",
+       "video_file": "Video file",
+       "youtube_url": "YouTube URL",
++      "kinescope_url": "Kinescope URL",
+       "video_settings": "Video Settings",
+       "start_time": "Start Time",
+       "end_time_optional": "End Time (optional)",
+@@ -3792,6 +3793,7 @@
+       "youtube_video": "YouTube Video",
+       "hosted_video": "Hosted Video",
+       "update_youtube_hint": "Update the YouTube link below",
++      "update_kinescope_hint": "Update the Kinescope link below",
+       "replace_video": "Replace video file",
+       "keep_current_video": "Leave empty to keep the current video",
+       "saving_captions": "Saving caption settings...",
+@@ -6574,7 +6576,7 @@
+         },
+         "activity_types": {
+           "dynamic": "A page you build with text, images, quizzes and more.",
+-          "video": "Upload a video file or link a YouTube video.",
++          "video": "Upload a video file or link a YouTube or Kinescope video.",
+           "document": "Share a PDF learners can read in the course.",
+           "assignment": "Collect work from learners and grade it.",
+           "markdown": "Show a Markdown file from a URL, like a GitHub README.",
+Index: b/lib/learnhouse/apps/web/locales/es.json
+===================================================================
+--- a/lib/learnhouse/apps/web/locales/es.json
++++ b/lib/learnhouse/apps/web/locales/es.json
+@@ -3836,6 +3836,7 @@
+       "source": "Fuente",
+       "video_file": "Archivo de vídeo",
+       "youtube_url": "URL de YouTube",
++      "kinescope_url": "URL de Kinescope",
+       "video_settings": "Ajustes del vídeo",
+       "start_time": "Hora de inicio",
+       "end_time_optional": "Hora de fin (opcional)",
+@@ -3858,6 +3859,7 @@
+       "youtube_video": "Vídeo de YouTube",
+       "hosted_video": "Vídeo alojado",
+       "update_youtube_hint": "Actualiza el enlace de YouTube de abajo",
++      "update_kinescope_hint": "Actualiza el enlace de Kinescope de abajo",
+       "replace_video": "Reemplazar archivo de vídeo",
+       "keep_current_video": "Déjalo vacío para conservar el vídeo actual",
+       "saving_captions": "Guardando ajustes de subtítulos...",
+@@ -6689,7 +6691,7 @@
+           "markdown": "Muestra un archivo Markdown desde una URL, como un README de GitHub.",
+           "resource": "Reutiliza un archivo o una página de tu biblioteca.",
+           "scorm": "Importa un paquete SCORM creado en otra herramienta.",
+-          "video": "Sube un archivo de vídeo o enlaza un vídeo de YouTube."
++          "video": "Sube un archivo de vídeo o enlaza un vídeo de YouTube o Kinescope."
+         },
+         "certification": {
+           "remove_confirm": "Desactivar",
+Index: b/lib/learnhouse/apps/web/locales/fa.json
+===================================================================
+--- a/lib/learnhouse/apps/web/locales/fa.json
++++ b/lib/learnhouse/apps/web/locales/fa.json
+@@ -3774,6 +3774,7 @@
+       "source": "منبع",
+       "video_file": "فایل ویدیو",
+       "youtube_url": "نشانی YouTube",
++      "kinescope_url": "نشانی Kinescope",
+       "video_settings": "تنظیمات ویدیو",
+       "start_time": "زمان شروع",
+       "end_time_optional": "زمان پایان (اختیاری)",
+@@ -3796,6 +3797,7 @@
+       "youtube_video": "ویدیوی YouTube",
+       "hosted_video": "ویدیوی میزبانی‌شده",
+       "update_youtube_hint": "پیوند YouTube را در زیر به‌روزرسانی کنید",
++      "update_kinescope_hint": "پیوند Kinescope را در زیر به‌روزرسانی کنید",
+       "replace_video": "جایگزینی فایل ویدیو",
+       "keep_current_video": "برای حفظ ویدیوی فعلی خالی بگذارید",
+       "saving_captions": "در حال ذخیرهٔ تنظیمات زیرنویس...",
+@@ -6592,7 +6594,7 @@
+           "markdown": "یک فایل Markdown را از یک URL نمایش دهید، مثل README در GitHub.",
+           "resource": "فایل یا صفحه‌ای را از کتابخانه خود دوباره استفاده کنید.",
+           "scorm": "بسته SCORMی را که در ابزار دیگری ساخته شده درون‌ریزی کنید.",
+-          "video": "یک فایل ویدیویی آپلود کنید یا پیوند ویدیوی YouTube بدهید."
++          "video": "یک فایل ویدیویی آپلود کنید یا پیوند ویدیوی YouTube یا Kinescope بدهید."
+         },
+         "certification": {
+           "remove_confirm": "خاموش کردن",
+Index: b/lib/learnhouse/apps/web/locales/fr.json
+===================================================================
+--- a/lib/learnhouse/apps/web/locales/fr.json
++++ b/lib/learnhouse/apps/web/locales/fr.json
+@@ -3836,6 +3836,7 @@
+       "source": "Source",
+       "video_file": "Fichier vidéo",
+       "youtube_url": "URL YouTube",
++      "kinescope_url": "URL Kinescope",
+       "video_settings": "Paramètres de la vidéo",
+       "start_time": "Heure de début",
+       "end_time_optional": "Heure de fin (facultatif)",
+@@ -3858,6 +3859,7 @@
+       "youtube_video": "Vidéo YouTube",
+       "hosted_video": "Vidéo hébergée",
+       "update_youtube_hint": "Mettez à jour le lien YouTube ci-dessous",
++      "update_kinescope_hint": "Mettez à jour le lien Kinescope ci-dessous",
+       "replace_video": "Remplacer le fichier vidéo",
+       "keep_current_video": "Laissez vide pour conserver la vidéo actuelle",
+       "saving_captions": "Enregistrement des paramètres de sous-titres...",
+@@ -6689,7 +6691,7 @@
+           "markdown": "Affichez un fichier Markdown depuis une URL, comme un README GitHub.",
+           "resource": "Réutilisez un fichier ou une page de votre bibliothèque.",
+           "scorm": "Importez un paquet SCORM créé dans un autre outil.",
+-          "video": "Importez un fichier vidéo ou liez une vidéo YouTube."
++          "video": "Importez un fichier vidéo ou liez une vidéo YouTube ou Kinescope."
+         },
+         "certification": {
+           "remove_confirm": "Désactiver",
+Index: b/lib/learnhouse/apps/web/locales/hi.json
+===================================================================
+--- a/lib/learnhouse/apps/web/locales/hi.json
++++ b/lib/learnhouse/apps/web/locales/hi.json
+@@ -3774,6 +3774,7 @@
+       "source": "स्रोत",
+       "video_file": "वीडियो फ़ाइल",
+       "youtube_url": "YouTube URL",
++      "kinescope_url": "Kinescope URL",
+       "video_settings": "वीडियो सेटिंग्स",
+       "start_time": "शुरू होने का समय",
+       "end_time_optional": "समाप्ति का समय (वैकल्पिक)",
+@@ -3796,6 +3797,7 @@
+       "youtube_video": "YouTube वीडियो",
+       "hosted_video": "होस्ट किया गया वीडियो",
+       "update_youtube_hint": "नीचे YouTube लिंक अपडेट करें",
++      "update_kinescope_hint": "नीचे Kinescope लिंक अपडेट करें",
+       "replace_video": "वीडियो फ़ाइल बदलें",
+       "keep_current_video": "मौजूदा वीडियो रखने के लिए खाली छोड़ें",
+       "saving_captions": "कैप्शन सेटिंग्स सहेजी जा रही हैं...",
+@@ -6592,7 +6594,7 @@
+           "markdown": "किसी URL से Markdown फ़ाइल दिखाएँ, जैसे GitHub का README।",
+           "resource": "अपनी लाइब्रेरी से कोई फ़ाइल या पेज दोबारा इस्तेमाल करें।",
+           "scorm": "किसी दूसरे टूल में बना SCORM पैकेज इंपोर्ट करें।",
+-          "video": "वीडियो फ़ाइल अपलोड करें या YouTube वीडियो लिंक करें।"
++          "video": "वीडियो फ़ाइल अपलोड करें या YouTube या Kinescope वीडियो लिंक करें।"
+         },
+         "certification": {
+           "remove_confirm": "बंद करें",
+Index: b/lib/learnhouse/apps/web/locales/id.json
+===================================================================
+--- a/lib/learnhouse/apps/web/locales/id.json
++++ b/lib/learnhouse/apps/web/locales/id.json
+@@ -3754,6 +3754,7 @@
+       "source": "Sumber",
+       "video_file": "File video",
+       "youtube_url": "URL YouTube",
++      "kinescope_url": "URL Kinescope",
+       "video_settings": "Pengaturan Video",
+       "start_time": "Waktu Mulai",
+       "end_time_optional": "Waktu Selesai (opsional)",
+@@ -3776,6 +3777,7 @@
+       "youtube_video": "Video YouTube",
+       "hosted_video": "Video yang Dihosting",
+       "update_youtube_hint": "Perbarui tautan YouTube di bawah",
++      "update_kinescope_hint": "Perbarui tautan Kinescope di bawah",
+       "replace_video": "Ganti file video",
+       "keep_current_video": "Biarkan kosong untuk mempertahankan video saat ini",
+       "saving_captions": "Menyimpan pengaturan teks...",
+@@ -6570,7 +6572,7 @@
+           "markdown": "Tampilkan file Markdown dari URL, seperti README GitHub.",
+           "resource": "Gunakan kembali file atau halaman dari pustaka Anda.",
+           "scorm": "Impor paket SCORM yang dibuat di alat lain.",
+-          "video": "Unggah file video atau tautkan video YouTube."
++          "video": "Unggah file video atau tautkan video YouTube atau Kinescope."
+         },
+         "certification": {
+           "remove_confirm": "Matikan",
+Index: b/lib/learnhouse/apps/web/locales/it.json
+===================================================================
+--- a/lib/learnhouse/apps/web/locales/it.json
++++ b/lib/learnhouse/apps/web/locales/it.json
+@@ -3836,6 +3836,7 @@
+       "source": "Sorgente",
+       "video_file": "File video",
+       "youtube_url": "URL di YouTube",
++      "kinescope_url": "URL di Kinescope",
+       "video_settings": "Impostazioni video",
+       "start_time": "Ora di inizio",
+       "end_time_optional": "Ora di fine (facoltativa)",
+@@ -3858,6 +3859,7 @@
+       "youtube_video": "Video YouTube",
+       "hosted_video": "Video ospitato",
+       "update_youtube_hint": "Aggiorna il link di YouTube qui sotto",
++      "update_kinescope_hint": "Aggiorna il link di Kinescope qui sotto",
+       "replace_video": "Sostituisci il file video",
+       "keep_current_video": "Lascia vuoto per mantenere il video attuale",
+       "saving_captions": "Salvataggio delle impostazioni dei sottotitoli...",
+@@ -6689,7 +6691,7 @@
+           "markdown": "Mostra un file Markdown da un URL, come un README di GitHub.",
+           "resource": "Riusa un file o una pagina dalla tua libreria.",
+           "scorm": "Importa un pacchetto SCORM creato in un altro strumento.",
+-          "video": "Carica un file video o collega un video di YouTube."
++          "video": "Carica un file video o collega un video di YouTube o Kinescope."
+         },
+         "certification": {
+           "remove_confirm": "Disattiva",
+Index: b/lib/learnhouse/apps/web/locales/ja.json
+===================================================================
+--- a/lib/learnhouse/apps/web/locales/ja.json
++++ b/lib/learnhouse/apps/web/locales/ja.json
+@@ -3756,6 +3756,7 @@
+       "source": "ソース",
+       "video_file": "動画ファイル",
+       "youtube_url": "YouTube URL",
++      "kinescope_url": "Kinescope URL",
+       "video_settings": "動画設定",
+       "start_time": "開始時間",
+       "end_time_optional": "終了時間（任意）",
+@@ -3778,6 +3779,7 @@
+       "youtube_video": "YouTube動画",
+       "hosted_video": "ホスティング動画",
+       "update_youtube_hint": "下のYouTubeリンクを更新してください",
++      "update_kinescope_hint": "下のKinescopeリンクを更新してください",
+       "replace_video": "動画ファイルを置き換え",
+       "keep_current_video": "現在の動画を維持する場合は空のままにしてください",
+       "saving_captions": "字幕設定を保存中...",
+@@ -6572,7 +6574,7 @@
+           "markdown": "GitHub の README のように、URL の Markdown ファイルを表示します。",
+           "resource": "ライブラリのファイルやページを再利用します。",
+           "scorm": "他のツールで作成した SCORM パッケージをインポートします。",
+-          "video": "動画ファイルをアップロードするか、YouTube 動画をリンクします。"
++          "video": "動画ファイルをアップロードするか、YouTube または Kinescope の動画をリンクします。"
+         },
+         "certification": {
+           "remove_confirm": "オフにする",
+Index: b/lib/learnhouse/apps/web/locales/ko.json
+===================================================================
+--- a/lib/learnhouse/apps/web/locales/ko.json
++++ b/lib/learnhouse/apps/web/locales/ko.json
+@@ -3754,6 +3754,7 @@
+       "source": "소스",
+       "video_file": "동영상 파일",
+       "youtube_url": "YouTube URL",
++      "kinescope_url": "Kinescope URL",
+       "video_settings": "동영상 설정",
+       "start_time": "시작 시간",
+       "end_time_optional": "종료 시간 (선택 사항)",
+@@ -3776,6 +3777,7 @@
+       "youtube_video": "YouTube 동영상",
+       "hosted_video": "직접 호스팅 동영상",
+       "update_youtube_hint": "아래의 YouTube 링크를 업데이트하세요",
++      "update_kinescope_hint": "아래의 Kinescope 링크를 업데이트하세요",
+       "replace_video": "동영상 파일 교체",
+       "keep_current_video": "현재 동영상을 유지하려면 비워 두세요",
+       "saving_captions": "자막 설정을 저장하는 중...",
+@@ -6570,7 +6572,7 @@
+           "markdown": "GitHub README처럼 URL의 Markdown 파일을 표시합니다.",
+           "resource": "라이브러리의 파일이나 페이지를 재사용합니다.",
+           "scorm": "다른 도구에서 만든 SCORM 패키지를 가져옵니다.",
+-          "video": "동영상 파일을 업로드하거나 YouTube 동영상을 연결합니다."
++          "video": "동영상 파일을 업로드하거나 YouTube 또는 Kinescope 동영상을 연결합니다."
+         },
+         "certification": {
+           "remove_confirm": "끄기",
+Index: b/lib/learnhouse/apps/web/locales/nl.json
+===================================================================
+--- a/lib/learnhouse/apps/web/locales/nl.json
++++ b/lib/learnhouse/apps/web/locales/nl.json
+@@ -3774,6 +3774,7 @@
+       "source": "Bron",
+       "video_file": "Videobestand",
+       "youtube_url": "YouTube-URL",
++      "kinescope_url": "Kinescope-URL",
+       "video_settings": "Video-instellingen",
+       "start_time": "Starttijd",
+       "end_time_optional": "Eindtijd (optioneel)",
+@@ -3796,6 +3797,7 @@
+       "youtube_video": "YouTube-video",
+       "hosted_video": "Gehoste video",
+       "update_youtube_hint": "Werk de YouTube-link hieronder bij",
++      "update_kinescope_hint": "Werk de Kinescope-link hieronder bij",
+       "replace_video": "Videobestand vervangen",
+       "keep_current_video": "Laat leeg om de huidige video te behouden",
+       "saving_captions": "Ondertitelinstellingen opslaan...",
+@@ -6592,7 +6594,7 @@
+           "markdown": "Toon een Markdown-bestand vanaf een URL, zoals een GitHub-README.",
+           "resource": "Hergebruik een bestand of pagina uit je bibliotheek.",
+           "scorm": "Importeer een SCORM-pakket uit een andere tool.",
+-          "video": "Upload een videobestand of koppel een YouTube-video."
++          "video": "Upload een videobestand of koppel een YouTube- of Kinescope-video."
+         },
+         "certification": {
+           "remove_confirm": "Uitschakelen",
+Index: b/lib/learnhouse/apps/web/locales/pl.json
+===================================================================
+--- a/lib/learnhouse/apps/web/locales/pl.json
++++ b/lib/learnhouse/apps/web/locales/pl.json
+@@ -3916,6 +3916,7 @@
+       "source": "Źródło",
+       "video_file": "Plik wideo",
+       "youtube_url": "Adres URL YouTube",
++      "kinescope_url": "Adres URL Kinescope",
+       "video_settings": "Ustawienia wideo",
+       "start_time": "Czas rozpoczęcia",
+       "end_time_optional": "Czas zakończenia (opcjonalnie)",
+@@ -3938,6 +3939,7 @@
+       "youtube_video": "Film z YouTube",
+       "hosted_video": "Film hostowany",
+       "update_youtube_hint": "Zaktualizuj poniższy link do YouTube",
++      "update_kinescope_hint": "Zaktualizuj poniższy link do Kinescope",
+       "replace_video": "Zamień plik wideo",
+       "keep_current_video": "Zostaw puste, aby zachować bieżące wideo",
+       "saving_captions": "Zapisywanie ustawień napisów...",
+@@ -6806,7 +6808,7 @@
+           "markdown": "Pokaż plik Markdown z adresu URL, na przykład README z GitHub.",
+           "resource": "Użyj ponownie pliku lub strony z biblioteki.",
+           "scorm": "Zaimportuj pakiet SCORM utworzony w innym narzędziu.",
+-          "video": "Prześlij plik wideo lub podlinkuj film z YouTube."
++          "video": "Prześlij plik wideo lub podlinkuj film z YouTube lub Kinescope."
+         },
+         "certification": {
+           "remove_confirm": "Wyłącz",
+Index: b/lib/learnhouse/apps/web/locales/pt.json
+===================================================================
+--- a/lib/learnhouse/apps/web/locales/pt.json
++++ b/lib/learnhouse/apps/web/locales/pt.json
+@@ -3836,6 +3836,7 @@
+       "source": "Origem",
+       "video_file": "Arquivo de vídeo",
+       "youtube_url": "URL do YouTube",
++      "kinescope_url": "URL do Kinescope",
+       "video_settings": "Configurações do vídeo",
+       "start_time": "Hora de início",
+       "end_time_optional": "Hora de término (opcional)",
+@@ -3858,6 +3859,7 @@
+       "youtube_video": "Vídeo do YouTube",
+       "hosted_video": "Vídeo hospedado",
+       "update_youtube_hint": "Atualize o link do YouTube abaixo",
++      "update_kinescope_hint": "Atualize o link do Kinescope abaixo",
+       "replace_video": "Substituir arquivo de vídeo",
+       "keep_current_video": "Deixe vazio para manter o vídeo atual",
+       "saving_captions": "Salvando configurações de legendas...",
+@@ -6689,7 +6691,7 @@
+           "markdown": "Mostre um arquivo Markdown a partir de uma URL, como um README do GitHub.",
+           "resource": "Reutilize um arquivo ou página da sua biblioteca.",
+           "scorm": "Importe um pacote SCORM criado em outra ferramenta.",
+-          "video": "Envie um arquivo de vídeo ou vincule um vídeo do YouTube."
++          "video": "Envie um arquivo de vídeo ou vincule um vídeo do YouTube ou do Kinescope."
+         },
+         "certification": {
+           "remove_confirm": "Desativar",
+Index: b/lib/learnhouse/apps/web/locales/ru.json
+===================================================================
+--- a/lib/learnhouse/apps/web/locales/ru.json
++++ b/lib/learnhouse/apps/web/locales/ru.json
+@@ -3916,6 +3916,7 @@
+       "source": "Источник",
+       "video_file": "Видеофайл",
+       "youtube_url": "URL YouTube",
++      "kinescope_url": "URL Kinescope",
+       "video_settings": "Настройки видео",
+       "start_time": "Время начала",
+       "end_time_optional": "Время окончания (необязательно)",
+@@ -3938,6 +3939,7 @@
+       "youtube_video": "Видео YouTube",
+       "hosted_video": "Загруженное видео",
+       "update_youtube_hint": "Обновите ссылку на YouTube ниже",
++      "update_kinescope_hint": "Обновите ссылку на Kinescope ниже",
+       "replace_video": "Заменить видеофайл",
+       "keep_current_video": "Оставьте пустым, чтобы сохранить текущее видео",
+       "saving_captions": "Сохранение настроек субтитров...",
+@@ -6806,7 +6808,7 @@
+           "markdown": "Показывайте файл Markdown по URL, например README с GitHub.",
+           "resource": "Используйте файл или страницу из вашей библиотеки повторно.",
+           "scorm": "Импортируйте пакет SCORM, созданный в другом инструменте.",
+-          "video": "Загрузите видеофайл или добавьте ссылку на видео YouTube."
++          "video": "Загрузите видеофайл или добавьте ссылку на видео YouTube или Kinescope."
+         },
+         "certification": {
+           "remove_confirm": "Отключить",
+Index: b/lib/learnhouse/apps/web/locales/sk.json
+===================================================================
+--- a/lib/learnhouse/apps/web/locales/sk.json
++++ b/lib/learnhouse/apps/web/locales/sk.json
+@@ -3916,6 +3916,7 @@
+       "source": "Zdroj",
+       "video_file": "Video súbor",
+       "youtube_url": "URL z YouTube",
++      "kinescope_url": "URL z Kinescope",
+       "video_settings": "Nastavenia videa",
+       "start_time": "Čas začiatku",
+       "end_time_optional": "Čas konca (voliteľné)",
+@@ -3938,6 +3939,7 @@
+       "youtube_video": "Video z YouTube",
+       "hosted_video": "Hostované video",
+       "update_youtube_hint": "Aktualizujte odkaz na YouTube nižšie",
++      "update_kinescope_hint": "Aktualizujte odkaz na Kinescope nižšie",
+       "replace_video": "Nahradiť video súbor",
+       "keep_current_video": "Nechajte prázdne, ak chcete zachovať aktuálne video",
+       "saving_captions": "Ukladajú sa nastavenia titulkov...",
+@@ -6806,7 +6808,7 @@
+           "markdown": "Zobrazte súbor Markdown z adresy URL, napríklad README z GitHubu.",
+           "resource": "Znovu použite súbor alebo stránku z knižnice.",
+           "scorm": "Importujte balík SCORM vytvorený v inom nástroji.",
+-          "video": "Nahrajte videosúbor alebo prepojte video z YouTube."
++          "video": "Nahrajte videosúbor alebo prepojte video z YouTube alebo Kinescope."
+         },
+         "certification": {
+           "remove_confirm": "Vypnúť",
+Index: b/lib/learnhouse/apps/web/locales/th.json
+===================================================================
+--- a/lib/learnhouse/apps/web/locales/th.json
++++ b/lib/learnhouse/apps/web/locales/th.json
+@@ -3754,6 +3754,7 @@
+       "source": "แหล่งที่มา",
+       "video_file": "ไฟล์วิดีโอ",
+       "youtube_url": "URL YouTube",
++      "kinescope_url": "URL Kinescope",
+       "video_settings": "การตั้งค่าวิดีโอ",
+       "start_time": "เวลาเริ่มต้น",
+       "end_time_optional": "เวลาสิ้นสุด (ไม่บังคับ)",
+@@ -3776,6 +3777,7 @@
+       "youtube_video": "วิดีโอ YouTube",
+       "hosted_video": "วิดีโอที่โฮสต์เอง",
+       "update_youtube_hint": "อัปเดตลิงก์ YouTube ด้านล่าง",
++      "update_kinescope_hint": "อัปเดตลิงก์ Kinescope ด้านล่าง",
+       "replace_video": "แทนที่ไฟล์วิดีโอ",
+       "keep_current_video": "เว้นว่างไว้เพื่อใช้วิดีโอเดิม",
+       "saving_captions": "กำลังบันทึกการตั้งค่าคำบรรยาย...",
+@@ -6570,7 +6572,7 @@
+           "markdown": "แสดงไฟล์ Markdown จาก URL เช่น README ของ GitHub",
+           "resource": "นำไฟล์หรือหน้าจากไลบรารีของคุณมาใช้ซ้ำ",
+           "scorm": "นำเข้าแพ็กเกจ SCORM ที่สร้างจากเครื่องมืออื่น",
+-          "video": "อัปโหลดไฟล์วิดีโอหรือเชื่อมโยงวิดีโอ YouTube"
++          "video": "อัปโหลดไฟล์วิดีโอหรือเชื่อมโยงวิดีโอ YouTube หรือ Kinescope"
+         },
+         "certification": {
+           "remove_confirm": "ปิด",
+Index: b/lib/learnhouse/apps/web/locales/tr.json
+===================================================================
+--- a/lib/learnhouse/apps/web/locales/tr.json
++++ b/lib/learnhouse/apps/web/locales/tr.json
+@@ -3774,6 +3774,7 @@
+       "source": "Kaynak",
+       "video_file": "Video dosyası",
+       "youtube_url": "YouTube URL'si",
++      "kinescope_url": "Kinescope URL'si",
+       "video_settings": "Video Ayarları",
+       "start_time": "Başlangıç Zamanı",
+       "end_time_optional": "Bitiş Zamanı (isteğe bağlı)",
+@@ -3796,6 +3797,7 @@
+       "youtube_video": "YouTube Videosu",
+       "hosted_video": "Barındırılan Video",
+       "update_youtube_hint": "Aşağıdaki YouTube bağlantısını güncelleyin",
++      "update_kinescope_hint": "Aşağıdaki Kinescope bağlantısını güncelleyin",
+       "replace_video": "Video dosyasını değiştir",
+       "keep_current_video": "Mevcut videoyu korumak için boş bırakın",
+       "saving_captions": "Altyazı ayarları kaydediliyor...",
+@@ -6592,7 +6594,7 @@
+           "markdown": "Bir URL'den Markdown dosyası gösterin, örneğin GitHub README.",
+           "resource": "Kitaplığınızdan bir dosyayı veya sayfayı yeniden kullanın.",
+           "scorm": "Başka bir araçta hazırlanmış bir SCORM paketini içe aktarın.",
+-          "video": "Bir video dosyası yükleyin veya bir YouTube videosu bağlayın."
++          "video": "Bir video dosyası yükleyin veya bir YouTube ya da Kinescope videosu bağlayın."
+         },
+         "certification": {
+           "remove_confirm": "Kapat",
+Index: b/lib/learnhouse/apps/web/locales/uk.json
+===================================================================
+--- a/lib/learnhouse/apps/web/locales/uk.json
++++ b/lib/learnhouse/apps/web/locales/uk.json
+@@ -3916,6 +3916,7 @@
+       "source": "Джерело",
+       "video_file": "Відеофайл",
+       "youtube_url": "URL-адреса YouTube",
++      "kinescope_url": "URL-адреса Kinescope",
+       "video_settings": "Налаштування відео",
+       "start_time": "Час початку",
+       "end_time_optional": "Час завершення (необов'язково)",
+@@ -3938,6 +3939,7 @@
+       "youtube_video": "Відео YouTube",
+       "hosted_video": "Відео на хостингу",
+       "update_youtube_hint": "Оновіть посилання на YouTube нижче",
++      "update_kinescope_hint": "Оновіть посилання на Kinescope нижче",
+       "replace_video": "Замінити відеофайл",
+       "keep_current_video": "Залиште порожнім, щоб зберегти поточне відео",
+       "saving_captions": "Збереження налаштувань субтитрів...",
+@@ -6806,7 +6808,7 @@
+           "markdown": "Показуйте файл Markdown за URL, наприклад README з GitHub.",
+           "resource": "Повторно використовуйте файл або сторінку з вашої бібліотеки.",
+           "scorm": "Імпортуйте пакет SCORM, створений в іншому інструменті.",
+-          "video": "Завантажте відеофайл або додайте посилання на відео YouTube."
++          "video": "Завантажте відеофайл або додайте посилання на відео YouTube чи Kinescope."
+         },
+         "certification": {
+           "remove_confirm": "Вимкнути",
+Index: b/lib/learnhouse/apps/web/locales/vi.json
+===================================================================
+--- a/lib/learnhouse/apps/web/locales/vi.json
++++ b/lib/learnhouse/apps/web/locales/vi.json
+@@ -3754,6 +3754,7 @@
+       "source": "Nguồn",
+       "video_file": "Tệp video",
+       "youtube_url": "URL YouTube",
++      "kinescope_url": "URL Kinescope",
+       "video_settings": "Cài đặt video",
+       "start_time": "Thời gian bắt đầu",
+       "end_time_optional": "Thời gian kết thúc (tùy chọn)",
+@@ -3776,6 +3777,7 @@
+       "youtube_video": "Video YouTube",
+       "hosted_video": "Video được lưu trữ",
+       "update_youtube_hint": "Cập nhật liên kết YouTube bên dưới",
++      "update_kinescope_hint": "Cập nhật liên kết Kinescope bên dưới",
+       "replace_video": "Thay thế tệp video",
+       "keep_current_video": "Để trống để giữ video hiện tại",
+       "saving_captions": "Đang lưu cài đặt phụ đề...",
+@@ -6570,7 +6572,7 @@
+           "markdown": "Hiển thị tệp Markdown từ một URL, như README trên GitHub.",
+           "resource": "Dùng lại một tệp hoặc trang từ thư viện của bạn.",
+           "scorm": "Nhập gói SCORM được tạo từ công cụ khác.",
+-          "video": "Tải lên tệp video hoặc liên kết video YouTube."
++          "video": "Tải lên tệp video hoặc liên kết video YouTube hoặc Kinescope."
+         },
+         "certification": {
+           "remove_confirm": "Tắt",
+Index: b/lib/learnhouse/apps/web/locales/zh.json
+===================================================================
+--- a/lib/learnhouse/apps/web/locales/zh.json
++++ b/lib/learnhouse/apps/web/locales/zh.json
+@@ -3756,6 +3756,7 @@
+       "source": "来源",
+       "video_file": "视频文件",
+       "youtube_url": "YouTube 链接",
++      "kinescope_url": "Kinescope 链接",
+       "video_settings": "视频设置",
+       "start_time": "开始时间",
+       "end_time_optional": "结束时间（可选）",
+@@ -3778,6 +3779,7 @@
+       "youtube_video": "YouTube 视频",
+       "hosted_video": "托管视频",
+       "update_youtube_hint": "请在下方更新 YouTube 链接",
++      "update_kinescope_hint": "请在下方更新 Kinescope 链接",
+       "replace_video": "替换视频文件",
+       "keep_current_video": "留空则保留当前视频",
+       "saving_captions": "正在保存字幕设置...",
+@@ -6572,7 +6574,7 @@
+           "markdown": "显示来自 URL 的 Markdown 文件，例如 GitHub README。",
+           "resource": "复用资源库中的文件或页面。",
+           "scorm": "导入由其他工具制作的 SCORM 包。",
+-          "video": "上传视频文件或链接 YouTube 视频。"
++          "video": "上传视频文件或链接 YouTube 或 Kinescope 视频。"
+         },
+         "certification": {
+           "remove_confirm": "关闭",

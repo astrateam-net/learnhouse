@@ -1,0 +1,21 @@
+.cache
+.DS_Store
+node_modules
+
+/.rumdl_cache
+/dist
+
+# Reference implementations, read-only; never committed.
+/.upstream
+
+# Quilt's internal data.
+/.pc
+/patches/*.diff~
+
+# Local-only agent tooling; the rest of .claude/ ships.
+/mise.local.toml
+/mise.local.lock
+/.mcp.json
+/CLAUDE.local.md
+/AGENTS.override.md
+/.claude/settings.local.json

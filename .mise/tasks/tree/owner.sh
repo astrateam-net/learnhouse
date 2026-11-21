@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+#MISE alias="owner"
+#MISE description="Name the owner of a path: overlay, patch, or upstream"
+#MISE dir="{{config_root}}"
+
+# Not `quilt annotate`: on a file no patch owns it exits 0 with no attribution,
+# which is indistinguishable from an unmodified upstream file — so an overlay
+# file reads as upstream's.
+
+set -Eeuo pipefail
+
+# Inherited git env would point `git -C` at the outer repo — see .mise/lib.sh.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY
+
+function main() {
+
+  local arg=${1-}
+  if [ -z "$arg" ]; then
+    echo "usage: mise run owner <path>   (relative to the repo or lib/learnhouse)" >&2
+    return 1
+  fi
+
+  # Reduce all three accepted spellings to one: relative to lib/learnhouse.
+  local rel=${arg#./}
+  rel=${rel#lib/learnhouse/}
+
+  local found=0
+
+  if [ -f "$rel" ] && [[ $rel == apps/* ]]; then
+    echo "overlay   $rel"
+    echo "          ours entirely — upstream has no version of it."
+    echo "          edit it here; the copy under lib/learnhouse/ is build output."
+    found=$((found + 1))
+  fi
+
+  local owners
+  owners=$(grep -l "^+++ [^/]*/lib/learnhouse/$rel\([[:space:]]\|\$\)" patches/*.diff 2> /dev/null \
+    | xargs -n1 basename 2> /dev/null || true)
+  if [ -n "$owners" ]; then
+    echo "patch     $rel"
+    # shellcheck disable=SC2001  # indenting every line of a multi-line value is
+    # not a substring replacement; ${var//} cannot express it.
+    echo "$owners" | sed 's/^/          /'
+    echo "          exists upstream; quilt owns the change. Line-level:"
+    echo "          quilt annotate lib/learnhouse/$rel"
+    found=$((found + 1))
+  fi
+
+  if [ "$found" -eq 0 ]; then
+    if git -C lib/learnhouse ls-files --error-unmatch "$rel" > /dev/null 2>&1; then
+      echo "upstream  $rel"
+      echo "          unmodified. Changing it means a patch: quilt add first."
+    else
+      echo "unowned   $rel"
+      echo "          in no patch and not in the overlay. If it is in the working tree"
+      echo "          it is invisible to a fresh checkout — series.bats fails on"
+      echo "          exactly this."
+    fi
+  fi
+
+  if [ "$found" -eq 2 ]; then
+    echo >&2 "error: owned twice. mise run overlay --check explains why that breaks."
+    return 1
+  fi
+}
+
+main "$@"

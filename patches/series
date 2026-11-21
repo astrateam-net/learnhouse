@@ -1,0 +1,14 @@
+# Apply order for the learnhouse patch series (quilt `series` format).
+#
+# Order is DATA, not a filename convention — a patch's name says what capability
+# it adds, never where it sits. Reordering is an edit to this file and nothing
+# else; there is no such operation as "renumbering".
+#
+# Each patch is one upstream pull request: apply it with the overlay files its
+# header names on a fork of learnhouse/learnhouse.
+#
+# `quilt push -a` applies these top to bottom onto the pinned lib/learnhouse submodule.
+kinescope-external-video.diff
+kinescope-embeds.diff
+kinescope-video-activity.diff
+kinescope-ai-tools.diff

@@ -1,0 +1,51 @@
+---
+schemaVersion: "2.0.0"
+
+# Structural: the image carries the Kinescope series, not stock LearnHouse. Playback needs a
+# browser and Kinescope, so it is covered by the unit tests and a deploy check.
+# No $name in command args: container-structure-test expands it before the shell runs.
+fileExistenceTests:
+  - name: Next standalone server
+    path: /app/web/server.js
+    shouldExist: true
+  - name: API source
+    path: /app/api/src/services/courses/activities/video.py
+    shouldExist: true
+
+commandTests:
+  - name: API accepts Kinescope external videos
+    command: grep
+    args: ["-q", "\"kinescope\"\\]", "/app/api/src/services/courses/activities/video.py"]
+    exitCode: 0
+  - name: AI tools offer kind=kinescope
+    command: grep
+    args: ["-q", "\"youtube\", \"kinescope\", \"video\", \"pdf\"", "/app/api/src/services/ai/tools/activities.py"]
+    exitCode: 0
+  - name: embed providers include Kinescope on the API side
+    command: grep
+    args: ["-q", "\"kinescope\": \"https://kinescope.io/", "/app/api/src/services/ai/tools/embeds.py"]
+    exitCode: 0
+  - name: web bundle carries the Kinescope player
+    command: sh
+    args: ["-c", "grep -rlq 'player.kinescope.io/latest/iframe.player.js' /app/web/.next/static"]
+    exitCode: 0
+  - name: Next server serves the Kinescope player chunk
+    command: sh
+    args:
+      - "-c"
+      - >-
+        cd /app/web || exit 1;
+        grep -rl 'player.kinescope.io/latest/iframe.player.js' .next/static | head -n1
+        | sed 's#^[.]next/#http://127.0.0.1:3999/_next/#' > /tmp/url;
+        [ -s /tmp/url ] || exit 1;
+        PORT=3999 HOSTNAME=127.0.0.1 node server.js >/tmp/web.log 2>&1 &
+        for n in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+        if curl -sf -o /dev/null "$(cat /tmp/url)"; then echo SERVED; exit 0; fi;
+        sleep 1;
+        done;
+        tail -n 20 /tmp/web.log; exit 1
+    exitCode: 0
+    expectedOutput: ["SERVED"]
+
+metadataTest:
+  exposedPorts: ["80", "4000", "9000"]

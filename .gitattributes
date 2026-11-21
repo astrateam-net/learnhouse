@@ -1,0 +1,5 @@
+# Patches are byte-exact artifacts: no eol rewriting, no merge driver.
+*.diff -text -merge
+patches/series text eol=lf
+
+*.sh text eol=lf
