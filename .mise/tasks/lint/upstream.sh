@@ -3,7 +3,7 @@
 #MISE dir="{{config_root}}"
 #MISE depends=["up"]
 # The same checks a LearnHouse pull request must pass, so every patch stays upstreamable.
-# Needs `bun install --frozen-lockfile` in apps/web and `uv sync --frozen` in apps/api.
+# Needs `bun install --frozen-lockfile` in apps/web and packages, and `uv sync --frozen` in apps/api.
 set -Eeuo pipefail
 
 # Inherited git env would point `git -C` at the outer repo — see .mise/lib.sh.

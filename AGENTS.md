@@ -39,7 +39,7 @@ The order is always `quilt push -a` → `mise run overlay` → build or test; `m
 
 `test:unit` and `lint:upstream` need upstream's dependencies, once per checkout:
 `(cd lib/learnhouse/apps/web && bun install --frozen-lockfile)` and
-`(cd lib/learnhouse/apps/api && uv sync --frozen)`.
+`(cd lib/learnhouse/apps/api && uv sync --frozen)` and `(cd lib/learnhouse/packages && bun install --frozen-lockfile)`.
 
 quilt is a system package (`brew install quilt`), not a mise tool. Never run `quilt` outside `mise`:
 `.quiltrc` reaches quilt only through the `QUILTRC` that mise exports.
