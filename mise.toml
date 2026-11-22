@@ -15,7 +15,7 @@ container-structure-test = "1.22.1"
 hk = "2.13.0"
 jq = "1.8.2"
 node = "26.13.1"
-pkl = "0.33.0"
+pkl = "0.33.1"
 # Upstream's runtime image (python:3.14.7); apps/api pins requires-python to it.
 python = "3.14.7"
 uv = "0.10.7"
