@@ -119,6 +119,10 @@ jobs:
       - name: Install LearnHouse's API dependencies
         working-directory: lib/learnhouse/apps/api
         run: mise exec -- uv sync --frozen
+      # The SDK generator (openapi-typescript) for the sdk-schema check.
+      - name: Install LearnHouse's packages dependencies
+        working-directory: lib/learnhouse/packages
+        run: mise exec -- bun install --frozen-lockfile
       # Upstream's own PR gates on what we touch, so every patch stays upstreamable.
       - run: mise run lint:upstream
       - run: mise run test:unit
