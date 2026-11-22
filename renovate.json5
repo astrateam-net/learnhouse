@@ -18,7 +18,7 @@
       // Upstream dictates them: the Dockerfile's bun, uv and node stages and
       // api-lint's ruff pin. A different toolchain diverges from upstream's build.
       matchManagers: ['mise'],
-      matchDepNames: ['bun', 'uv', 'node', 'ruff'],
+      matchDepNames: ['bun', 'uv', 'node', 'python', 'ruff'],
       enabled: false,
     },
   ],
