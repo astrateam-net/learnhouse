@@ -17,6 +17,28 @@ upstream commit on its own line under the heading.
 
 ## Unreleased
 
+LearnHouse 1.4.5 at learnhouse/learnhouse@57abad4 (dev)
+
+### Changed
+
+- Rebased on upstream dev, which adds a video provider extension point
+  (learnhouse/learnhouse#1352): Vimeo and Loom links, resume, trim and
+  transcripts for every external video.
+- The Kinescope series is cut on that extension point. The API side is
+  upstream's own Kinescope support from #1352, which upstream dropped again in
+  ec9ebed5a; the web side registers a Kinescope provider in the open-source
+  provider list instead of patching the player and dialogs.
+- Kinescope ids follow upstream's rule, so UUID ids (with dashes) are accepted.
+
+### Added
+
+- Kinescope playback gets resume, playback rate and the seek/getTime controls
+  through the provider's player.
+- Kinescope links in LMS course import (HTML iframes and video tags).
+- The migration docs list every external video type, Loom included.
+
+## 4.5.0 - 2026-11-22
+
 LearnHouse 1.4.5 at learnhouse/learnhouse@dde7c8e (dev)
 
 ### Added

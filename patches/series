@@ -8,7 +8,5 @@
 # header names on a fork of learnhouse/learnhouse.
 #
 # `quilt push -a` applies these top to bottom onto the pinned lib/learnhouse submodule.
-kinescope-external-video.diff
-kinescope-embeds.diff
-kinescope-video-activity.diff
-kinescope-ai-tools.diff
+kinescope-api.diff
+kinescope-video-provider.diff

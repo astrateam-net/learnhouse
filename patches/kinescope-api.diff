@@ -1,0 +1,496 @@
+feat(api): recognise Kinescope video links
+
+The API knows YouTube, Vimeo and Loom only. A Kinescope link (kinescope.io)
+cannot be stored as an external video activity, the AI tools and MCP reject it
+for create_media_activity and build_course, the `embed` fence and LMS import
+leave it a generic iframe.
+
+Bring back the Kinescope support that landed with learnhouse/learnhouse#1352
+and was dropped again in ec9ebed5a ("chore: drop unused video embed provider"):
+"kinescope" in ExternalVideoType, kinescope_id() and the embed provider in
+embeds.py, kind="kinescope" for the AI tools, Kinescope iframes in
+html_to_tiptap, the MCP instructions and the SDK schema (packages/sdk,
+regenerated). Kinescope is stored like the other services; the web plays it
+through a registered video provider. The migration docs list every external
+type, Loom included.
+
+Covered by `test_core_html_to_tiptap.py`, `test_block_specs.py`,
+`test_courses.py` and `test_video_activity_updates.py`.
+Index: b/lib/learnhouse/apps/api/src/services/ai/tools/activities.py
+===================================================================
+--- a/lib/learnhouse/apps/api/src/services/ai/tools/activities.py
++++ b/lib/learnhouse/apps/api/src/services/ai/tools/activities.py
+@@ -37,6 +37,7 @@ from src.services.ai.tools.chapters impo
+ )
+ from src.services.ai.tools.content_assets import attach_media, check_media, check_url, fetch, media_reason
+ from src.services.ai.tools.content_edit import require_risky_approval
++from src.services.ai.tools.embeds import kinescope_id
+ from src.services.ai.tools.markdown import MAX_CHARS, Converted, convert
+ from src.services.ai.tools.results import changed, clip
+ from src.services.courses.activities.activities import (
+@@ -117,15 +118,16 @@ class CreateActivitiesParams(BaseModel):
+ class CreateMediaActivityParams(BaseModel):
+     chapter_uuid: str = Field(..., max_length=100, description="The chapter to add the activity to (chapter_...).")
+     name: str = Field(..., min_length=1, max_length=200, description="Activity name.")
+-    kind: Literal["youtube", "video", "pdf"] = Field(
++    kind: Literal["youtube", "kinescope", "video", "pdf"] = Field(
+         ...,
+         description=(
+-            "youtube: a YouTube video shown in the video player; "
++            "youtube: a YouTube video shown in the video player; kinescope: a video hosted on "
++            "Kinescope (kinescope.io/<id>), shown in the video player; "
+             "video: an mp4/webm file, fetched and stored (up to 200 MB); pdf: a PDF document, "
+             "fetched and stored (up to 50 MB)."
+         ),
+     )
+-    url: str = Field(..., min_length=8, max_length=2048, description="The YouTube link, or the public URL of the file itself.")
++    url: str = Field(..., min_length=8, max_length=2048, description="The YouTube or Kinescope link, or the public URL of the file itself.")
+     position: int | None = Field(
+         None, ge=0, le=10_000, description="0-based place in the chapter; omit to add at the end."
+     )
+@@ -310,6 +312,24 @@ async def _create_media_activity(ctx: To
+             ),
+             ctx.db_session,
+         )
++    elif p.kind == "kinescope":
++        video = kinescope_id(p.url)
++        if video is None:
++            raise HTTPException(
++                status_code=400,
++                detail="That is not a Kinescope video link (kinescope.io/<id> or kinescope.io/embed/<id>).",
++            )
++        activity = await create_external_video_activity(
++            ctx.request,
++            ctx.user,
++            ExternalVideo(
++                name=p.name,
++                uri=f"https://kinescope.io/{video}",
++                type="kinescope",
++                chapter_id=chapter.id,
++            ),
++            ctx.db_session,
++        )
+     else:
+         check_url(p.url)
+         host = urlsplit(p.url).hostname
+@@ -334,7 +354,7 @@ async def _create_media_activity(ctx: To
+         )
+     if p.position is not None:
+         await place_activity(ctx, course, chapter.id, activity.id, p.position)
+-    what = {"youtube": "video", "video": "video", "pdf": "document"}[p.kind]
++    what = {"youtube": "video", "kinescope": "video", "video": "video", "pdf": "document"}[p.kind]
+     return changed(
+         f"Created {what} activity '{activity.name}' in chapter '{chapter.name}' "
+         + ("(the course is a draft: it shows once the course is published)." if ready
+Index: b/lib/learnhouse/apps/api/src/services/ai/tools/block_specs.py
+===================================================================
+--- a/lib/learnhouse/apps/api/src/services/ai/tools/block_specs.py
++++ b/lib/learnhouse/apps/api/src/services/ai/tools/block_specs.py
+@@ -683,7 +683,7 @@ class EmbedB(_B):
+ 
+ class VideoB(_B):
+     type: Literal["video"]
+-    url: WebUrl = Field(..., min_length=8, max_length=2048, description="YouTube/Vimeo/Loom link (embedded) or a .mp4/.webm file (stored; needs approval).")
++    url: WebUrl = Field(..., min_length=8, max_length=2048, description="YouTube/Vimeo/Loom/Kinescope link (embedded) or a .mp4/.webm file (stored; needs approval).")
+     caption: str | None = Field(None, max_length=500)
+ 
+ 
+Index: b/lib/learnhouse/apps/api/src/services/ai/tools/content_assets.py
+===================================================================
+--- a/lib/learnhouse/apps/api/src/services/ai/tools/content_assets.py
++++ b/lib/learnhouse/apps/api/src/services/ai/tools/content_assets.py
+@@ -78,6 +78,7 @@ _EMBED_HOSTS = {
+     "youtube.com": "youtube", "youtu.be": "youtube", "youtube-nocookie.com": "youtube",
+     "vimeo.com": "vimeo", "loom.com": "loom", "dailymotion.com": "dailymotion",
+     "figma.com": "figma", "codepen.io": "codepen", "canva.com": "canva",
++    "kinescope.io": "kinescope",
+ }
+ 
+ 
+Index: b/lib/learnhouse/apps/api/src/services/ai/tools/content_blocks.py
+===================================================================
+--- a/lib/learnhouse/apps/api/src/services/ai/tools/content_blocks.py
++++ b/lib/learnhouse/apps/api/src/services/ai/tools/content_blocks.py
+@@ -357,11 +357,11 @@ CATALOG: dict[str, dict[str, Any]] = {
+         ]},
+     },
+     "blockEmbed": {
+-        "use": "Embedded YouTube, Vimeo, Loom, Figma, CodePen, Google Maps, ...",
++        "use": "Embedded YouTube, Vimeo, Loom, Kinescope, Figma, CodePen, Google Maps, ...",
+         "add": "Markdown fence: ```embed with the video or page URL on one line (optional height: 400), or insert {node}.",
+         "attrs": {"embedUrl": "embeddable http(s) URL", "embedType": "url (embedUrl) or code (embedCode)", "embedHeight": "pixels", "embedWidth": "e.g. 100%", "alignment": "left | center | right", "embedCode": "raw iframe code instead of embedUrl"},
+         "example": {"type": "blockEmbed", "attrs": {"embedUrl": "https://www.youtube.com/embed/aqz-KE-bpKQ", "embedType": "url", "embedHeight": 400, "embedWidth": "100%", "alignment": "center"}},
+-        "notes": "The fence turns shared YouTube, Vimeo and Loom links into embed URLs; raw nodes need the provider's embed URL (YouTube: /embed/<id>).",
++        "notes": "The fence turns shared YouTube, Vimeo, Loom and Kinescope links into embed URLs; raw nodes need the provider's embed URL (YouTube: /embed/<id>, Kinescope: kinescope.io/embed/<id>).",
+     },
+     "blockWebPreview": {
+         "use": "Link card for a web page.",
+Index: b/lib/learnhouse/apps/api/src/services/ai/tools/embeds.py
+===================================================================
+--- a/lib/learnhouse/apps/api/src/services/ai/tools/embeds.py
++++ b/lib/learnhouse/apps/api/src/services/ai/tools/embeds.py
+@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, quote
+ PROVIDERS = (
+     "youtube", "vimeo", "loom", "figma", "google-docs", "google-sheets", "google-slides",
+     "google-forms", "google-drive", "google-maps", "codepen", "codesandbox", "spotify",
+-    "soundcloud", "miro", "canva", "desmos", "geogebra",
++    "soundcloud", "miro", "canva", "desmos", "geogebra", "kinescope",
+ )
+ 
+ # One example per provider, for the block catalog and tests.
+@@ -39,6 +39,7 @@ EXAMPLES = {
+     "canva": "https://www.canva.com/design/DAF123/view",
+     "desmos": "https://www.desmos.com/calculator/abc123",
+     "geogebra": "https://www.geogebra.org/m/abc123",
++    "kinescope": "https://kinescope.io/7127f2d7-0e96-40d0-9a03-2e987c096466",
+ }
+ 
+ _YT = re.compile(
+@@ -46,6 +47,9 @@ _YT = re.compile(
+     r"([A-Za-z0-9_-]{11})"
+ )
+ _VIMEO = re.compile(r"^https?://(?:www\.|player\.)?vimeo\.com/(?:video/)?(\d{6,12})")
++# Kinescope share (kinescope.io/<id>) and embed (kinescope.io/embed/<id>)
++# links. Ids are short slugs, numbers or UUIDs.
++_KINESCOPE = re.compile(r"^/(?:embed/)?([A-Za-z0-9][A-Za-z0-9-]{4,63})/?$")
+ _YT_TIME = re.compile(r"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$")
+ 
+ 
+@@ -99,6 +103,18 @@ def youtube_seconds(value: str | None) -
+     return h * 3600 + mi * 60 + s
+ 
+ 
++def kinescope_id(url: str) -> str | None:
++    """The video id of a Kinescope share or embed link, or None."""
++    source = normalize_url(url)
++    if source is None:
++        return None
++    u = urlsplit(source)
++    if (u.hostname or "").lower().removeprefix("www.") != "kinescope.io":
++        return None
++    m = _KINESCOPE.match(u.path or "/")
++    return m.group(1) if m and m.group(1).lower() != "embed" else None
++
++
+ def parse_embed(url: str) -> ParsedEmbed | None:
+     source = normalize_url(url)
+     if source is None:
+@@ -130,6 +146,13 @@ def parse_embed(url: str) -> ParsedEmbed
+         parts = path.split("/")
+         if len(parts) > 2 and parts[2]:
+             return make("loom", "Loom", f"https://www.loom.com/embed/{parts[2]}", 16 / 9)
++    kinescope = kinescope_id(source)
++    if kinescope:
++        # Stored like any embed; a registered Kinescope video provider plays
++        # it with progress, otherwise it frames as a plain iframe.
++        start = (query.get("t") or [""])[0]
++        suffix = f"?t={start}" if start.isdigit() else ""
++        return make("kinescope", "Kinescope", f"https://kinescope.io/embed/{kinescope}{suffix}", 16 / 9)
+     if host == "figma.com" and re.match(r"^/(file|design|proto|board|slides)/", path):
+         target = source.replace("http://", "https://", 1)
+         return make("figma", "Figma", f"https://www.figma.com/embed?embed_host=learnhouse&url={quote(target, safe='')}", 16 / 9)
+Index: b/lib/learnhouse/apps/api/src/services/courses/activities/video.py
+===================================================================
+--- a/lib/learnhouse/apps/api/src/services/courses/activities/video.py
++++ b/lib/learnhouse/apps/api/src/services/courses/activities/video.py
+@@ -174,8 +174,9 @@ async def create_video_activity(
+     return ActivityRead.model_validate(activity)
+ 
+ 
+-# Where an external video plays from.
+-ExternalVideoType = Literal["youtube", "vimeo", "loom"]
++# Where an external video plays from. Kinescope is stored like the others and
++# played by its registered video provider.
++ExternalVideoType = Literal["youtube", "vimeo", "loom", "kinescope"]
+ 
+ 
+ class ExternalVideo(BaseModel):
+Index: b/lib/learnhouse/apps/api/src/services/courses/lms_import/html_to_tiptap.py
+===================================================================
+--- a/lib/learnhouse/apps/api/src/services/courses/lms_import/html_to_tiptap.py
++++ b/lib/learnhouse/apps/api/src/services/courses/lms_import/html_to_tiptap.py
+@@ -137,6 +137,15 @@ _YOUTUBE = re.compile(
+ _VIMEO = re.compile(r"vimeo\.com/(?:video/|channels/[^/]+/|groups/[^/]+/videos/)?(\d+)")
+ 
+ 
++# Kinescope share and embed links (kinescope.io/<id>, kinescope.io/embed/<id>).
++_KINESCOPE = re.compile(r"^https?://(?:www\.)?kinescope\.io/(?:embed/)?([A-Za-z0-9][A-Za-z0-9-]{4,63})/?(?:[?#].*)?$")
++
++
++def kinescope_id(url: str) -> Optional[str]:
++    m = _KINESCOPE.match((url or "").strip())
++    return m.group(1) if m and m.group(1).lower() != "embed" else None
++
++
+ def youtube_id(url: str) -> Optional[str]:
+     m = _YOUTUBE.search(url or "")
+     return m.group(1) if m else None
+@@ -199,6 +208,24 @@ def math_node(latex: str) -> dict:
+ 
+ 
+ def embed_node(url: str = "", code: str = "", height: int = 500) -> dict:
++    kid = kinescope_id(url) if url else None
++    if kid:
++        # Same attrs the editor stores for a pasted Kinescope link, so the
++        # registered Kinescope player plays it.
++        return {
++            "type": "blockEmbed",
++            "attrs": {
++                "embedUrl": f"https://kinescope.io/embed/{kid}",
++                "embedSourceUrl": url,
++                "embedProvider": "kinescope",
++                "embedCode": None,
++                "embedType": "url",
++                "embedHeight": max(150, min(int(height or 500), 2000)),
++                "embedAspectRatio": 16 / 9,
++                "embedWidth": "100%",
++                "alignment": "center",
++            },
++        }
+     return {
+         "type": "blockEmbed",
+         "attrs": {
+@@ -544,7 +571,7 @@ class HtmlConverter:
+ 
+     def _src_block(self, src: str, kind: Optional[MediaKind], title: str) -> Optional[dict]:
+         if is_http_url(src):
+-            if youtube_id(src) or vimeo_id(src):
++            if youtube_id(src) or vimeo_id(src) or kinescope_id(src):
+                 return embed_node(src, height=450)
+             if kind == MediaKind.IMAGE:
+                 return self.media.remote_image_node(src)
+Index: b/lib/learnhouse/apps/api/src/services/mcp/server.py
+===================================================================
+--- a/lib/learnhouse/apps/api/src/services/mcp/server.py
++++ b/lib/learnhouse/apps/api/src/services/mcp/server.py
+@@ -101,7 +101,7 @@ exercises with tests, ```scenario for br
+ ```button with a link, and ```preview, ```h5p and ```widget (custom HTML), which need \
+ approval. Images go in as ![alt](https://...) on their own line, and files as ```image, \
+ ```video, ```audio or ```pdf fences with the URL: they are fetched and stored after one \
+-approval. create_media_activity adds a YouTube video, video file or PDF as \
++approval. create_media_activity adds a YouTube or Kinescope video, video file or PDF as \
+ its own activity. Make pages rich: mix explanation with images, quizzes, exercises and scenarios. \
+ Interactive Experiences have no fence; add them as typed blocks with add_blocks or \
+ build_course: sort, sequence, match_pairs, hotspot, fill_gaps, myth_fact, speed_round, \
+Index: b/lib/learnhouse/apps/api/src/tests/lms_import/test_core_html_to_tiptap.py
+===================================================================
+--- a/lib/learnhouse/apps/api/src/tests/lms_import/test_core_html_to_tiptap.py
++++ b/lib/learnhouse/apps/api/src/tests/lms_import/test_core_html_to_tiptap.py
+@@ -410,6 +410,21 @@ def test_node_builders():
+     assert math_node("  x^2 ")["attrs"]["math_equation"] == "x^2"
+ 
+ 
++def test_kinescope_embeds():
++    assert h2t.kinescope_id("https://kinescope.io/embed/203613411?autoplay=1") == "203613411"
++    assert h2t.kinescope_id("https://kinescope.io/embed/") is None
++    assert h2t.kinescope_id("https://kinescope.com/203613411") is None
++    assert h2t.kinescope_id(None) is None
++    e = embed_node("https://kinescope.io/jZrVWUsQnDS4RCZhnhH9Ab", height=450)
++    assert e["attrs"]["embedProvider"] == "kinescope"
++    assert e["attrs"]["embedUrl"] == "https://kinescope.io/embed/jZrVWUsQnDS4RCZhnhH9Ab"
++    assert e["attrs"]["embedAspectRatio"] == 16 / 9
++    assert_valid_blocks([e])
++    out, _, _ = conv('<iframe src="https://kinescope.io/embed/203613411"></iframe>'
++                     '<video src="https://kinescope.io/203613411"></video>')
++    assert [b["attrs"]["embedProvider"] for b in out] == ["kinescope", "kinescope"]
++
++
+ def test_embed_node_attrs():
+     e = embed_node("https://youtu.be/dQw4w9WgXcQ", height=50)
+     assert e["attrs"]["embedUrl"] == "https://www.youtube.com/embed/dQw4w9WgXcQ"
+Index: b/lib/learnhouse/apps/api/src/tests/services/ai_tools/test_block_specs.py
+===================================================================
+--- a/lib/learnhouse/apps/api/src/tests/services/ai_tools/test_block_specs.py
++++ b/lib/learnhouse/apps/api/src/tests/services/ai_tools/test_block_specs.py
+@@ -133,6 +133,23 @@ def test_embed_edge_cases():
+     assert parse_embed("https://docs.google.com/presentation/d/e/2PACX/pub").embed_url.endswith("/embed")
+ 
+ 
++def test_kinescope_links():
++    from src.services.ai.tools.embeds import kinescope_id
++
++    share = parse_embed("https://kinescope.io/203613411?t=60")
++    assert share.provider == "kinescope" and share.embed_url == "https://kinescope.io/embed/203613411?t=60"
++    assert parse_embed("kinescope.io/embed/jZrVWUsQnDS4RCZhnhH9Ab").embed_url == "https://kinescope.io/embed/jZrVWUsQnDS4RCZhnhH9Ab"
++    assert parse_embed("https://kinescope.io/203613411?t=abc").embed_url == "https://kinescope.io/embed/203613411"
++    assert kinescope_id("https://kinescope.io/embed/") is None
++    assert kinescope_id("https://kinescope.io/a/b") is None
++    assert kinescope_id("https://kinescope.com/203613411") is None
++    assert kinescope_id("not a url") is None
++    # A video block with a Kinescope link stays an embed (played by the Kinescope provider).
++    doc = bs.to_converted(bs.parse_blocks([{"type": "video", "url": "https://kinescope.io/203613411"}])).doc
++    assert doc["content"][0]["type"] == "blockEmbed"
++    assert doc["content"][0]["attrs"]["embedProvider"] == "kinescope"
++
++
+ def test_member_cards_only_through_the_typed_block_and_only_for_members():
+     card = {"type": "blockUser", "attrs": {"user_id": 999, "layout": "card"}}
+     for raw in (
+Index: b/lib/learnhouse/apps/api/src/tests/services/ai_tools/test_courses.py
+===================================================================
+--- a/lib/learnhouse/apps/api/src/tests/services/ai_tools/test_courses.py
++++ b/lib/learnhouse/apps/api/src/tests/services/ai_tools/test_courses.py
+@@ -813,6 +813,19 @@ async def test_create_media_activity_you
+     assert bad.status == "denied" and "YouTube" in bad.reason
+ 
+ 
++async def test_create_media_activity_kinescope(registry, db, org, admin_user, course, chapter, activity):
++    args = {"chapter_uuid": "chapter_test", "name": "DRM lesson", "kind": "kinescope",
++            "url": "https://kinescope.io/embed/7127f2d7-0e96-40d0-9a03-2e987c096466"}
++    out = await call(registry, ctx_for(db, org, admin_user), "create_media_activity", args)
++    assert out.status == "executed", out.reason
++    row = (await db.execute(select(Activity).where(Activity.activity_uuid == out.result["activity"]["uuid"]))).scalars().one()
++    assert row.content["type"] == "kinescope"
++    assert row.content["uri"] == "https://kinescope.io/7127f2d7-0e96-40d0-9a03-2e987c096466"
++    bad = await call(registry, ctx_for(db, org, admin_user), "create_media_activity",
++                     {**args, "url": "https://youtu.be/aqz-KE-bpKQ"})
++    assert bad.status == "denied" and "Kinescope" in bad.reason
++
++
+ async def test_create_media_activity_pdf(registry, db, org, admin_user, course, chapter, net):  # noqa: F811 (fixture)
+     pdf = b"%PDF-1.7\n" + b"0" * 200
+     net.routes[("files.test", "/doc.pdf")] = httpx.Response(200, content=pdf, headers={"content-type": "application/pdf"})
+Index: b/lib/learnhouse/apps/api/src/tests/services/test_video_activity_updates.py
+===================================================================
+--- a/lib/learnhouse/apps/api/src/tests/services/test_video_activity_updates.py
++++ b/lib/learnhouse/apps/api/src/tests/services/test_video_activity_updates.py
+@@ -365,6 +365,17 @@ async def test_create_external_loom(mock
+     assert created.activity_sub_type == ActivitySubTypeEnum.SUBTYPE_VIDEO_YOUTUBE
+ 
+ 
++async def test_create_external_kinescope(mock_request, db, org, course, chapter, admin_user, rag_dispatch):
++    with patch(f"{MOD}.check_resource_access", new=AsyncMock()), patch(f"{MOD}.track_activity_created", new=AsyncMock()):
++        created = await create_external_video_activity(
++            mock_request, admin_user,
++            ExternalVideo(name="K", uri="https://kinescope.io/203613411", type="kinescope", chapter_id=chapter.id),
++            db,
++        )
++    assert created.content["type"] == "kinescope"
++    assert created.activity_sub_type == ActivitySubTypeEnum.SUBTYPE_VIDEO_YOUTUBE
++
++
+ def test_external_video_rejects_unknown_service():
+     with pytest.raises(ValueError):
+         ExternalVideo(name="X", uri="https://example.com/v", type="dailymotion", chapter_id=1)
+Index: b/lib/learnhouse/docs/content/developers/migration/activity-types.mdx
+===================================================================
+--- a/lib/learnhouse/docs/content/developers/migration/activity-types.mdx
++++ b/lib/learnhouse/docs/content/developers/migration/activity-types.mdx
+@@ -295,7 +295,7 @@ curl -X POST "http://localhost:1338/api/
+ 
+ ### External video (`SUBTYPE_VIDEO_YOUTUBE`)
+ 
+-For YouTube and Vimeo embeds. Note the sub-type name is historical. The same sub-type covers Vimeo too, distinguished by the `type` field in the request.
++For YouTube, Vimeo, Loom and Kinescope embeds. Note the sub-type name is historical. The same sub-type covers every external service, distinguished by the `type` field in the request.
+ 
+ **Create endpoint:** `POST /api/v1/activities/external_video`
+ 
+@@ -315,8 +315,8 @@ curl -X POST "http://localhost:1338/api/
+ | Field | Type | Required | Notes |
+ | --- | --- | --- | --- |
+ | `name` | string | Yes | Activity title |
+-| `uri` | string | Yes | YouTube or Vimeo URL |
+-| `type` | enum | Yes | `"youtube"` or `"vimeo"` |
++| `uri` | string | Yes | YouTube, Vimeo, Loom or Kinescope URL |
++| `type` | enum | Yes | `"youtube"`, `"vimeo"`, `"loom"` or `"kinescope"` |
+ | `chapter_id` | string | Yes | Numeric chapter ID, sent as a string |
+ | `details` | string | No | JSON-encoded player options (same keys as above), defaults to `"{}"` |
+ 
+Index: b/lib/learnhouse/docs/content/developers/migration/programmatic.mdx
+===================================================================
+--- a/lib/learnhouse/docs/content/developers/migration/programmatic.mdx
++++ b/lib/learnhouse/docs/content/developers/migration/programmatic.mdx
+@@ -188,7 +188,7 @@ curl -X POST "http://localhost:1338/api/
+   }'
+ ```
+ 
+-`type` accepts `"youtube"` or `"vimeo"`. `chapter_id` and `details` are both **strings** for this endpoint. `details` is a JSON-encoded string that the server parses.
++`type` accepts `"youtube"`, `"vimeo"`, `"loom"` or `"kinescope"`. `chapter_id` and `details` are both **strings** for this endpoint. `details` is a JSON-encoded string that the server parses.
+ 
+ ### 3d. PDF document: `POST /api/v1/activities/documentpdf`
+ 
+Index: b/lib/learnhouse/packages/sdk/openapi.json
+===================================================================
+--- a/lib/learnhouse/packages/sdk/openapi.json
++++ b/lib/learnhouse/packages/sdk/openapi.json
+@@ -60453,18 +60453,19 @@
+             "type": "string",
+             "enum": [
+               "youtube",
++              "kinescope",
+               "video",
+               "pdf"
+             ],
+             "title": "Kind",
+-            "description": "youtube: a YouTube video shown in the video player; video: an mp4/webm file, fetched and stored (up to 200 MB); pdf: a PDF document, fetched and stored (up to 50 MB)."
++            "description": "youtube: a YouTube video shown in the video player; kinescope: a video hosted on Kinescope (kinescope.io/<id>), shown in the video player; video: an mp4/webm file, fetched and stored (up to 200 MB); pdf: a PDF document, fetched and stored (up to 50 MB)."
+           },
+           "url": {
+             "type": "string",
+             "maxLength": 2048,
+             "minLength": 8,
+             "title": "Url",
+-            "description": "The YouTube link, or the public URL of the file itself."
++            "description": "The YouTube or Kinescope link, or the public URL of the file itself."
+           },
+           "position": {
+             "anyOf": [
+@@ -62994,7 +62995,8 @@
+             "enum": [
+               "youtube",
+               "vimeo",
+-              "loom"
++              "loom",
++              "kinescope"
+             ],
+             "title": "Type"
+           },
+@@ -63060,7 +63062,8 @@
+                 "enum": [
+                   "youtube",
+                   "vimeo",
+-                  "loom"
++                  "loom",
++                  "kinescope"
+                 ]
+               },
+               {
+Index: b/lib/learnhouse/packages/sdk/src/generated/schema.ts
+===================================================================
+--- a/lib/learnhouse/packages/sdk/src/generated/schema.ts
++++ b/lib/learnhouse/packages/sdk/src/generated/schema.ts
+@@ -19361,13 +19361,13 @@ export interface components {
+             name: string;
+             /**
+              * Kind
+-             * @description youtube: a YouTube video shown in the video player; video: an mp4/webm file, fetched and stored (up to 200 MB); pdf: a PDF document, fetched and stored (up to 50 MB).
++             * @description youtube: a YouTube video shown in the video player; kinescope: a video hosted on Kinescope (kinescope.io/<id>), shown in the video player; video: an mp4/webm file, fetched and stored (up to 200 MB); pdf: a PDF document, fetched and stored (up to 50 MB).
+              * @enum {string}
+              */
+-            kind: "youtube" | "video" | "pdf";
++            kind: "youtube" | "kinescope" | "video" | "pdf";
+             /**
+              * Url
+-             * @description The YouTube link, or the public URL of the file itself.
++             * @description The YouTube or Kinescope link, or the public URL of the file itself.
+              */
+             url: string;
+             /**
+@@ -20443,7 +20443,7 @@ export interface components {
+              * Type
+              * @enum {string}
+              */
+-            type: "youtube" | "vimeo" | "loom";
++            type: "youtube" | "vimeo" | "loom" | "kinescope";
+             /** Chapter Id */
+             chapter_id: number;
+             /**
+@@ -20463,7 +20463,7 @@ export interface components {
+             /** Uri */
+             uri?: string | null;
+             /** Type */
+-            type?: ("youtube" | "vimeo" | "loom") | null;
++            type?: ("youtube" | "vimeo" | "loom" | "kinescope") | null;
+             /** Starttime */
+             startTime?: number | null;
+             /** Endtime */

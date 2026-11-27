@@ -1,6 +1,15 @@
 'use client'
 
+/*
+ Kinescope through its IFrame Player API
+ (player.kinescope.io/latest/iframe.player.js, loaded on first use). Reports
+ progress, the end, rate changes and the player controls the same way the
+ Vimeo player does, so analytics, resume and notes work unchanged.
+*/
 import React, { useEffect, useRef } from 'react'
+import { kinescopeVideoUrl } from '@/lib/media/kinescope'
+import { UnsupportedVideo } from './ExternalVideoPlayer'
+import type { ExternalPlayerProps } from './providers/types'
 
 const API_SCRIPT = 'https://player.kinescope.io/latest/iframe.player.js'
 
@@ -35,38 +44,30 @@ function loadKinescopeFactory(): Promise<any> {
 
 let nextId = 0
 
-export interface KinescopePlayerProps {
-  url: string
-  title?: string
-  autoplay?: boolean
-  muted?: boolean
-  startTime?: number
-  endTime?: number | null
-  onProgress?: (_currentTime: number, _duration: number) => void
-  onEnded?: () => void
-  onPlayer?: (_player: any) => void
-}
-
 export default function KinescopePlayer({
   url,
   title,
-  autoplay = false,
-  muted = false,
-  startTime = 0,
-  endTime = null,
+  startTime,
+  endTime,
+  autoplay,
+  muted,
+  resumeAt,
+  playbackRate,
   onProgress,
   onEnded,
-  onPlayer,
-}: KinescopePlayerProps) {
+  onRateChange,
+  onReady,
+}: ExternalPlayerProps) {
   const hostRef = useRef<HTMLDivElement>(null)
-  const callbacks = useRef({ onProgress, onEnded, onPlayer })
+  const videoUrl = kinescopeVideoUrl(url)
+  const latest = useRef({ startTime, endTime, resumeAt, playbackRate, onProgress, onEnded, onRateChange, onReady })
   useEffect(() => {
-    callbacks.current = { onProgress, onEnded, onPlayer }
+    latest.current = { startTime, endTime, resumeAt, playbackRate, onProgress, onEnded, onRateChange, onReady }
   })
 
   useEffect(() => {
     const host = hostRef.current
-    if (!host) return
+    if (!host || !videoUrl) return
     let cancelled = false
     let player: any = null
     let duration = 0
@@ -82,15 +83,15 @@ export default function KinescopePlayer({
     const finish = () => {
       if (ended) return
       ended = true
-      callbacks.current.onEnded?.()
+      latest.current.onEnded?.()
     }
 
     loadKinescopeFactory()
       .then((factory) =>
         factory.create(mount.id, {
-          url,
+          url: videoUrl,
           size: { width: '100%', height: '100%' },
-          behavior: { autoPlay: autoplay, muted },
+          behavior: { autoPlay: !!autoplay, muted: !!muted, playsInline: true },
         })
       )
       .then((created: any) => {
@@ -102,7 +103,17 @@ export default function KinescopePlayer({
         const Events = created.Events
         created.once(Events.Loaded, (event: any) => {
           duration = Number(event?.data?.duration) || 0
-          if (startTime > 0) created.seekTo(startTime)
+          const { resumeAt: resume, startTime: start, playbackRate: rate } = latest.current
+          const from = resume || start || 0
+          if (from > 0) created.seekTo(from)
+          if (rate && rate !== 1) created.setPlaybackRate?.(rate)
+          latest.current.onReady?.({
+            getTime: () =>
+              Promise.resolve(created.getCurrentTime())
+                .then((t: unknown) => (Number.isFinite(Number(t)) ? Number(t) : null))
+                .catch(() => null),
+            seek: (s) => created.seekTo(Math.max(0, s)),
+          })
         })
         created.on(Events.DurationChange, (event: any) => {
           duration = Number(event?.data?.duration) || duration
@@ -110,18 +121,24 @@ export default function KinescopePlayer({
         created.on(Events.TimeUpdate, (event: any) => {
           const currentTime = Number(event?.data?.currentTime)
           if (!Number.isFinite(currentTime)) return
-          if (endTime && currentTime >= endTime) {
+          const end = latest.current.endTime
+          if (end && currentTime >= end) {
             created.pause()
             finish()
             return
           }
-          if (duration > 0) callbacks.current.onProgress?.(currentTime, duration)
+          if (duration > 0) latest.current.onProgress?.(currentTime, duration)
         })
         created.on(Events.Ended, finish)
         created.on(Events.Play, () => {
           ended = false
         })
-        callbacks.current.onPlayer?.(created)
+        if (Events.PlaybackRateChange) {
+          created.on(Events.PlaybackRateChange, (event: any) => {
+            const rate = Number(event?.data?.playbackRate)
+            if (Number.isFinite(rate)) latest.current.onRateChange?.(rate)
+          })
+        }
       })
       .catch(() => {})
 
@@ -130,7 +147,8 @@ export default function KinescopePlayer({
       const done = player?.destroy?.()
       Promise.resolve(done).finally(() => mount.remove())
     }
-  }, [url, autoplay, muted, startTime, endTime])
+  }, [videoUrl, autoplay, muted])
 
+  if (!videoUrl) return <UnsupportedVideo url={url} />
   return <div ref={hostRef} title={title} className="absolute inset-0 h-full w-full bg-[#0d0d0e]" />
 }

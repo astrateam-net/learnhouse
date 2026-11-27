@@ -1,0 +1,62 @@
+feat(web): play Kinescope through the video provider extension point
+
+The open-source build registers no extra video providers, so a stored
+Kinescope video (an external video activity or an Embed block) shows "This
+video can't be played here" or a bare iframe: no progress, completion, resume
+or notes clock.
+
+Register Kinescope in the open-source provider list
+(`@ee/components/Video/videoProviders`, the ee-stub). The provider
+(providers/kinescope.ts, new) matches share and embed links with the API's
+rule (lib/media/kinescope.ts, new) and lazy-loads KinescopePlayer (new), which
+drives Kinescope's IFrame Player API (player.kinescope.io/latest/iframe.player.js)
+through ExternalPlayerProps the way the Vimeo player does: progress, the end,
+trim, resume, playback rate and the seek/getTime controls. Paste detection,
+Embed blocks, badges and hints pick it up from the registry; the Kinescope
+badge tone and the Video.tsx note come back from learnhouse/learnhouse#1352.
+An Enterprise build replaces the stub, and its own Kinescope player with it.
+
+Covered by `kinescope.test.mjs`; `video-providers.test.mjs` and
+`editor-blocks.test.mjs` keep passing.
+Index: b/lib/learnhouse/apps/web/components/Objects/Activities/Video/Video.tsx
+===================================================================
+--- a/lib/learnhouse/apps/web/components/Objects/Activities/Video/Video.tsx
++++ b/lib/learnhouse/apps/web/components/Objects/Activities/Video/Video.tsx
+@@ -62,7 +62,7 @@ interface VideoActivityProps {
+     content: {
+       filename?: string
+       uri?: string
+-      /** External videos: youtube | vimeo | loom (absent = youtube). */
++      /** External videos: youtube | vimeo | loom | kinescope… (absent = youtube). */
+       type?: string
+     }
+     details?: VideoDetails
+Index: b/lib/learnhouse/apps/web/components/Objects/Activities/Video/VideoSourceFields.tsx
+===================================================================
+--- a/lib/learnhouse/apps/web/components/Objects/Activities/Video/VideoSourceFields.tsx
++++ b/lib/learnhouse/apps/web/components/Objects/Activities/Video/VideoSourceFields.tsx
+@@ -18,10 +18,11 @@ const SOURCE_TONES: Record<string, strin
+   youtube: 'bg-rose-50 text-rose-700 ring-rose-600/15',
+   vimeo: 'bg-sky-50 text-sky-700 ring-sky-600/15',
+   loom: 'bg-violet-50 text-violet-700 ring-violet-600/15',
++  kinescope: 'bg-amber-50 text-amber-800 ring-amber-600/20',
+   upload: 'bg-neutral-100 text-neutral-700 ring-neutral-900/10',
+ }
+ 
+-/** "YouTube", "Vimeo", "Upload"… as a small coloured pill. */
++/** "YouTube", "Kinescope", "Upload"… as a small coloured pill. */
+ export function VideoSourceBadge({ provider, label, className }: { provider: string; label: string; className?: string }) {
+   return (
+     <span
+Index: b/lib/learnhouse/apps/web/ee-stub/components/Video/videoProviders.ts
+===================================================================
+--- a/lib/learnhouse/apps/web/ee-stub/components/Video/videoProviders.ts
++++ b/lib/learnhouse/apps/web/ee-stub/components/Video/videoProviders.ts
+@@ -1,4 +1,5 @@
+ import type { VideoProvider } from '@components/Objects/Activities/Video/providers/types'
++import { kinescopeVideoProvider } from '@components/Objects/Activities/Video/providers/kinescope'
+ 
+-/** Extra video providers. None in the open-source build. */
+-export const EE_VIDEO_PROVIDERS: VideoProvider[] = []
++/** Extra video providers. Kinescope in the open-source build. */
++export const EE_VIDEO_PROVIDERS: VideoProvider[] = [kinescopeVideoProvider]
