@@ -11,9 +11,11 @@ The router, service and providers (src/routers/sso.py, src/services/sso/,
 src/db/sso.py, new) come from the SSO code LearnHouse published in apps/api/ee
 until 66c4865b1, moved onto the async session and today's sign-in path:
 
-- The callback mints the session through issue_session_or_challenge with
-  amr "sso", so two-factor, session provenance and custom-domain binding
-  apply as for every other sign-in; the body matches the web callback page.
+- The callback mints the session with amr "sso", with session provenance and
+  custom-domain binding as for every other sign-in; the body matches the web
+  callback page. When the org exempts external sign-ins from two-factor
+  (exempt_external_auth) the IdP's second factor counts and no LearnHouse code
+  is asked; otherwise issue_session_or_challenge challenges as usual.
 - The SSO state lives in Redis, single use, ten minutes.
 - The IdP redirects to the web page <org URL>/auth/sso/callback.
 - A matching email never takes over an account. An existing account is
@@ -29,7 +31,9 @@ until 66c4865b1, moved onto the async session and today's sign-in path:
 
 The web app stops hiding SSO in community builds: "sso" leaves
 OSS_BLOCKED_FEATURES, the login page asks /auth/sso/check instead of assuming
-none, and the Developers SSO tab carries the Business badge on SaaS only.
+none, and the Developers SSO tab carries the Business badge on SaaS only. A
+two-factor challenge from the SSO callback goes to /login, the public sign-in
+path (/auth/login is its internal rewrite and 404s from outside).
 
 The plan overview and feature resolution tests now expect SSO in the community
 edition; the latter keeps SCORM as its edition-only example.
@@ -127,7 +131,7 @@ Index: b/lib/learnhouse/docs/content/enterprise/sso/index.mdx
  <PlanCta plan="Enterprise" />
  </Callout>
  
-@@ -61,10 +61,10 @@ With **Auto-provision Users** on, a memb
+@@ -61,13 +61,13 @@ With **Auto-provision Users** on, a memb
  
  LearnHouse does **not** link an SSO identity to an existing account just because the email matches. An existing account is accepted only when:
  
@@ -140,7 +144,11 @@ Index: b/lib/learnhouse/docs/content/enterprise/sso/index.mdx
 +Otherwise the sign-in is refused, and the member is asked to sign in with their usual method. On an instance that hosts several organizations, Backoffice accounts never sign in through SSO.
  
  <Callout type="info">
- Members who sign in through SSO can be exempted from your two-factor requirement, since the identity provider handles it. See [Two-Factor Authentication](/platform/users/two-factor#requiring-2fa-in-your-organization).
+-Members who sign in through SSO can be exempted from your two-factor requirement, since the identity provider handles it. See [Two-Factor Authentication](/platform/users/two-factor#requiring-2fa-in-your-organization).
++Members who sign in through SSO can be exempted from your two-factor requirement, since the identity provider handles it. With that exemption on, an SSO sign-in never asks for a LearnHouse code, even from members who set up two-factor themselves; password sign-in still does. See [Two-Factor Authentication](/platform/users/two-factor#requiring-2fa-in-your-organization).
+ </Callout>
+ 
+ ## Callback URL
 @@ -75,7 +75,7 @@ Members who sign in through SSO can be e
  Your identity provider needs LearnHouse's callback URL:
  
@@ -1871,3 +1879,17 @@ Index: b/lib/learnhouse/apps/api/src/tests/security/test_feature_resolve.py
          assert oss_allowed == {
              "enabled": True,
              "available": True,
+Index: b/lib/learnhouse/apps/web/app/auth/sso/callback/page.tsx
+===================================================================
+--- a/lib/learnhouse/apps/web/app/auth/sso/callback/page.tsx
++++ b/lib/learnhouse/apps/web/app/auth/sso/callback/page.tsx
+@@ -93,7 +93,8 @@ export default function SSOCallbackPage(
+               // Malformed redirect: same default.
+             }
+           }
+-          router.push(`/auth/login?${mfaParams.toString()}`)
++          // `/login` is the public sign-in path; `/auth/login` is only its internal rewrite.
++          router.push(`/login?${mfaParams.toString()}`)
+           return
+         }
+ 

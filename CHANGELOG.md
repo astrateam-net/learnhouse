@@ -19,6 +19,21 @@ upstream commit on its own line under the heading.
 
 LearnHouse 1.4.5 at learnhouse/learnhouse@57abad4 (dev)
 
+### Changed
+
+- With "exempt users who sign in via Google or SSO" on, an SSO sign-in no
+  longer asks for a LearnHouse two-factor code: the identity provider's second
+  factor counts. Password sign-in still asks.
+
+### Fixed
+
+- An SSO sign-in that does ask for a code went to `/auth/login`, a 404 from
+  outside; it now opens `/login`.
+
+## 4.5.3 - 2026-11-28
+
+LearnHouse 1.4.5 at learnhouse/learnhouse@57abad4 (dev)
+
 ### Fixed
 
 - SSO refused the instance's first admin with `platform_sign_in_required`: the

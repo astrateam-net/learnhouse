@@ -311,8 +311,9 @@ async def sso_callback(
     db_session: AsyncSession = Depends(get_db_session),
 ):
     from src.routers.auth import _bind_session_to_custom_domain, get_token_expiry_ms, set_auth_cookies
-    from src.services.auth.session import issue_session_or_challenge
+    from src.services.auth.session import issue_session_or_challenge, mint_session_tokens, track_login
     from src.services.nudges.links import org_base_url
+    from src.services.orgs.mfa_policy import get_org_mfa_policy
 
     if error:
         error_msg = error_description or _get_idp_error_message(error)
@@ -344,9 +345,15 @@ async def sso_callback(
     session_org_id, on_custom_domain = await _bind_session_to_custom_domain(
         request, db_session, user.id, org_id, AUTH_METHOD_SSO
     )
-    issue = await issue_session_or_challenge(
-        db_session, user, amr=AUTH_METHOD_SSO, org_id=session_org_id, custom_domain=on_custom_domain,
-    )
+    policy = await get_org_mfa_policy(db_session, org_id)
+    if policy.exempt_external_auth:
+        # The org trusts its IdP's second factor: no LearnHouse code on top of it.
+        issue = mint_session_tokens(user.email, AUTH_METHOD_SSO, session_org_id, on_custom_domain)
+        await track_login(user.id, AUTH_METHOD_SSO, session_org_id)
+    else:
+        issue = await issue_session_or_challenge(
+            db_session, user, amr=AUTH_METHOD_SSO, org_id=session_org_id, custom_domain=on_custom_domain,
+        )
     if issue.mfa_required:
         return {
             "mfa_required": True,
