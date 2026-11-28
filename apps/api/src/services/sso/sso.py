@@ -459,7 +459,13 @@ async def find_or_create_sso_user(
             )
         return await create_sso_user(request, profile, connection, db_session)
 
-    if user.id is not None and await is_user_backoffice_staff(user.id, db_session):
+    # On a multi-org instance one org's IdP must not mint a platform admin's session.
+    # Single tenancy has one org, whose first admin the installer makes backoffice staff.
+    if (
+        _multi_tenant()
+        and user.id is not None
+        and await is_user_backoffice_staff(user.id, db_session)
+    ):
         raise _sso_error(
             403, "platform_sign_in_required", "platform_sign_in_required",
             "Platform administrators must sign in on the platform's own sign-in page.",
@@ -487,6 +493,12 @@ async def find_or_create_sso_user(
 
     await _record_sso_login(request, user, connection.org_id, db_session)
     return user
+
+
+def _multi_tenant() -> bool:
+    from config.config import get_learnhouse_config
+
+    return get_learnhouse_config().hosting_config.tenancy == "multi"
 
 
 async def _only_member_of(user: User, org_id: int, db_session: AsyncSession) -> bool:

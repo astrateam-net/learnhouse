@@ -19,6 +19,16 @@ upstream commit on its own line under the heading.
 
 LearnHouse 1.4.5 at learnhouse/learnhouse@57abad4 (dev)
 
+### Fixed
+
+- SSO refused the instance's first admin with `platform_sign_in_required`: the
+  installer makes that account backoffice staff, and the backoffice rule now
+  applies only on multi-organization instances.
+
+## 4.5.2 - 2026-11-28
+
+LearnHouse 1.4.5 at learnhouse/learnhouse@57abad4 (dev)
+
 ### Added
 
 - Single sign-on with OpenID Connect (and WorkOS, untested) in the community
