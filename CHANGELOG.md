@@ -21,6 +21,21 @@ LearnHouse 1.4.5 at learnhouse/learnhouse@57abad4 (dev)
 
 ### Changed
 
+- An SSO sign-in lands on the page that asked for it (the login page's
+  `?next`, such as the MCP consent screen), through a two-factor challenge too.
+
+### Security
+
+- The SSO state is bound to the browser that started the sign-in (httpOnly
+  `LH_sso_state` cookie): a callback link carrying someone else's code no longer
+  signs the reader in as that person.
+
+## 4.5.4 - 2026-11-28
+
+LearnHouse 1.4.5 at learnhouse/learnhouse@57abad4 (dev)
+
+### Changed
+
 - With "exempt users who sign in via Google or SSO" on, an SSO sign-in no
   longer asks for a LearnHouse two-factor code: the identity provider's second
   factor counts. Password sign-in still asks.

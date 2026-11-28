@@ -16,7 +16,12 @@ until 66c4865b1, moved onto the async session and today's sign-in path:
   callback page. When the org exempts external sign-ins from two-factor
   (exempt_external_auth) the IdP's second factor counts and no LearnHouse code
   is asked; otherwise issue_session_or_challenge challenges as usual.
-- The SSO state lives in Redis, single use, ten minutes.
+- The SSO state lives in Redis, single use, ten minutes, and is bound to the
+  browser that started the sign-in by an httpOnly LH_sso_state cookie, so a
+  callback link carrying someone else's code is refused (login CSRF). It also
+  carries the page to land on: the login page passes its ?next to
+  /auth/sso/authorize (same-origin paths only), and the callback returns
+  /redirect_from_auth?next=..., kept through a two-factor challenge.
 - The IdP redirects to the web page <org URL>/auth/sso/callback.
 - A matching email never takes over an account. An existing account is
   accepted when SSO created it and every recorded sign-in went through SSO,
@@ -163,7 +168,7 @@ Index: b/lib/learnhouse/packages/sdk/openapi.json
 ===================================================================
 --- a/lib/learnhouse/packages/sdk/openapi.json
 +++ b/lib/learnhouse/packages/sdk/openapi.json
-@@ -38623,6 +38623,575 @@
+@@ -38623,6 +38623,594 @@
          }
        }
      },
@@ -587,6 +592,25 @@ Index: b/lib/learnhouse/packages/sdk/openapi.json
 +              "title": "Org Slug"
 +            },
 +            "description": "Organization slug"
++          },
++          {
++            "name": "next",
++            "in": "query",
++            "required": false,
++            "schema": {
++              "anyOf": [
++                {
++                  "type": "string",
++                  "maxLength": 512
++                },
++                {
++                  "type": "null"
++                }
++              ],
++              "description": "Same-origin path to land on after sign-in",
++              "title": "Next"
++            },
++            "description": "Same-origin path to land on after sign-in"
 +          }
 +        ],
 +        "responses": {
@@ -739,7 +763,7 @@ Index: b/lib/learnhouse/packages/sdk/openapi.json
      "/api/v1/tools": {
        "get": {
          "tags": [
-@@ -75528,6 +76097,301 @@
+@@ -75528,6 +76116,301 @@
          "type": "object",
          "title": "RulesBody"
        },
@@ -1320,7 +1344,7 @@ Index: b/lib/learnhouse/packages/sdk/src/generated/schema.ts
           * SaveActivityContentRequest
           * @description Request to save AI-generated content to an activity
           */
-@@ -60111,6 +60372,480 @@ export interface operations {
+@@ -60111,6 +60372,482 @@ export interface operations {
                  headers: {
                      [name: string]: unknown;
                  };
@@ -1704,6 +1728,8 @@ Index: b/lib/learnhouse/packages/sdk/src/generated/schema.ts
 +            query: {
 +                /** @description Organization slug */
 +                org_slug: string;
++                /** @description Same-origin path to land on after sign-in */
++                next?: string | null;
 +            };
 +            header?: never;
 +            path?: never;
@@ -1820,6 +1846,17 @@ Index: b/lib/learnhouse/apps/web/app/auth/login/login.tsx
          setSsoEnabled(false)
          return
        }
+@@ -284,7 +285,9 @@ const LoginClient = (props: LoginClientP
+     track(AnalyticsEvent.LoginSsoClicked)
+     setSsoLoading(true)
+     try {
+-      await redirectToSSOLogin(props.org.slug)
++      // The same post-login destination a password sign-in would use.
++      const next = new URL(buildCallbackUrl()).searchParams.get('next') ?? undefined
++      await redirectToSSOLogin(props.org.slug, next)
+     } catch (error: any) {
+       setError(error.message || t('auth.sso_error'))
+       setSsoLoading(false)
 Index: b/lib/learnhouse/apps/web/app/orgs/[orgslug]/dash/developers/layout.tsx
 ===================================================================
 --- a/lib/learnhouse/apps/web/app/orgs/[orgslug]/dash/developers/layout.tsx
@@ -1883,7 +1920,25 @@ Index: b/lib/learnhouse/apps/web/app/auth/sso/callback/page.tsx
 ===================================================================
 --- a/lib/learnhouse/apps/web/app/auth/sso/callback/page.tsx
 +++ b/lib/learnhouse/apps/web/app/auth/sso/callback/page.tsx
-@@ -93,7 +93,8 @@ export default function SSOCallbackPage(
+@@ -81,19 +81,20 @@ export default function SSOCallbackPage(
+           if (result.redirect_url) {
+             try {
+               const target = new URL(result.redirect_url, window.location.origin)
+-              const next = `${target.pathname}${target.search}`
+-              if (
+-                target.origin === window.location.origin &&
+-                target.pathname !== '/redirect_from_auth' &&
+-                /^\/(?!\/)/.test(next)
+-              ) {
++              // The handoff page carries the real destination in its own ?next.
++              const next =
++                target.pathname === '/redirect_from_auth'
++                  ? target.searchParams.get('next') ?? ''
++                  : `${target.pathname}${target.search}`
++              if (target.origin === window.location.origin && /^\/(?!\/)/.test(next)) {
+                 mfaParams.set('redirect_to', next)
+               }
+             } catch {
                // Malformed redirect: same default.
              }
            }
@@ -1893,3 +1948,34 @@ Index: b/lib/learnhouse/apps/web/app/auth/sso/callback/page.tsx
            return
          }
  
+Index: b/lib/learnhouse/apps/web/services/auth/sso.ts
+===================================================================
+--- a/lib/learnhouse/apps/web/services/auth/sso.ts
++++ b/lib/learnhouse/apps/web/services/auth/sso.ts
+@@ -323,10 +323,13 @@ export async function checkSSOEnabled(
+  * Returns authorization URL to redirect user to identity provider.
+  */
+ export async function initiateSSOLogin(
+-  orgSlug: string
++  orgSlug: string,
++  next?: string
+ ): Promise<SSOAuthorizationResponse> {
++  const params = new URLSearchParams({ org_slug: orgSlug })
++  if (next) params.set('next', next)
+   const response = await fetch(
+-    `${getAPIUrl()}auth/sso/authorize?org_slug=${encodeURIComponent(orgSlug)}`,
++    `${getAPIUrl()}auth/sso/authorize?${params.toString()}`,
+     {
+       method: 'GET',
+       headers: {
+@@ -392,8 +395,8 @@ export async function handleSSOCallback(
+  * Redirect user to SSO login.
+  * Convenience function that initiates SSO and redirects in one step.
+  */
+-export async function redirectToSSOLogin(orgSlug: string): Promise<void> {
+-  const response = await initiateSSOLogin(orgSlug)
++export async function redirectToSSOLogin(orgSlug: string, next?: string): Promise<void> {
++  const response = await initiateSSOLogin(orgSlug, next)
+   const destination = safeExternalUrl(response.authorization_url)
+   if (!destination) throw new Error('Invalid SSO authorization URL')
+   window.location.href = destination
