@@ -10,3 +10,4 @@
 # `quilt push -a` applies these top to bottom onto the pinned lib/learnhouse submodule.
 kinescope-api.diff
 kinescope-video-provider.diff
+sso-oidc.diff

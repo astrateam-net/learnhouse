@@ -1,0 +1,1870 @@
+feat(api): single sign-on with OIDC in community builds
+
+The web app ships the SSO settings, the "Sign in with SSO" button and the
+callback page, and the core knows the "sso" sign-in method, but the API side
+lives only in the Enterprise Edition: a community build answers every
+/auth/sso call with 404 and resolves the "sso" feature as edition-only.
+
+Mount a community SSO router at /auth/sso when no Enterprise Edition is
+present (an EE build keeps its own), and drop "sso" from EE_ONLY_FEATURES.
+The router, service and providers (src/routers/sso.py, src/services/sso/,
+src/db/sso.py, new) come from the SSO code LearnHouse published in apps/api/ee
+until 66c4865b1, moved onto the async session and today's sign-in path:
+
+- The callback mints the session through issue_session_or_challenge with
+  amr "sso", so two-factor, session provenance and custom-domain binding
+  apply as for every other sign-in; the body matches the web callback page.
+- The SSO state lives in Redis, single use, ten minutes.
+- The IdP redirects to the web page <org URL>/auth/sso/callback.
+- A matching email never takes over an account. An existing account is
+  accepted when SSO created it and every recorded sign-in went through SSO,
+  or when it belongs to this organization alone, its email is in an allowed
+  domain and the IdP sends email_verified: true. Backoffice accounts never
+  sign in through an org's SSO. A new account's email counts as proven only
+  under a verified custom domain of the org.
+- OIDC discovery, token and userinfo requests use the pinned SSRF-guarded
+  transport and must be https; LEARNHOUSE_SSO_TRUSTED_HOSTS names IdP hosts
+  allowed on private addresses (a self-hosted IdP). The admin API never returns the client
+  secret; an empty one on update keeps it.
+
+The web app stops hiding SSO in community builds: "sso" leaves
+OSS_BLOCKED_FEATURES, the login page asks /auth/sso/check instead of assuming
+none, and the Developers SSO tab carries the Business badge on SaaS only.
+
+The plan overview and feature resolution tests now expect SSO in the community
+edition; the latter keeps SCORM as its edition-only example.
+The docs describe the callback URL and the account rules. SDK schema
+regenerated.
+
+Covered by `test_sso.py` and `sso-community.test.mjs`; `test_plan_overview_router.py`,
+`test_root_router.py`, `test_license_entitlements.py`, `test_feature_resolve.py` and
+`test_login_provenance.py` keep passing.
+Index: b/lib/learnhouse/apps/api/src/core/deployment_mode.py
+===================================================================
+--- a/lib/learnhouse/apps/api/src/core/deployment_mode.py
++++ b/lib/learnhouse/apps/api/src/core/deployment_mode.py
+@@ -23,7 +23,7 @@ DeploymentMode = Literal['saas', 'oss',
+ 
+ # Features blocked in OSS mode but available in EE and plan-gated in SaaS
+ EE_ONLY_FEATURES: frozenset[str] = frozenset({
+-    'sso', 'audit_logs', 'payments', 'analytics_advanced', 'scorm', 'lti', 'xapi', 'live_sessions', 'messaging',
++    'audit_logs', 'payments', 'analytics_advanced', 'scorm', 'lti', 'xapi', 'live_sessions', 'messaging',
+     'playgrounds', 'scim', 'required_training', 'company_seats', 'newsletter', 'boards',
+     'crm', 'crm_salesforce',
+ })
+Index: b/lib/learnhouse/apps/api/src/router.py
+===================================================================
+--- a/lib/learnhouse/apps/api/src/router.py
++++ b/lib/learnhouse/apps/api/src/router.py
+@@ -48,7 +48,7 @@ from src.routers import learner_notes as
+ from src.routers.courses import translations as course_translations_router_module
+ from src.routers.podcasts import podcasts as podcasts_router_module
+ from src.routers.podcasts import episodes as episodes_router_module
+-from src.core.ee_hooks import register_ee_routers
++from src.core.ee_hooks import get_ee_hooks, register_ee_routers
+ from src.core.deployment_mode import get_deployment_mode
+ from src.services.dev.dev import isDevModeEnabledOrRaise
+ from src.routers.utils import router as utils_router
+@@ -495,6 +495,12 @@ v1_router.include_router(
+     dependencies=[Depends(get_non_api_token_user)],
+ )
+ 
++# Community SSO (OIDC, WorkOS); an Enterprise Edition mounts its own instead.
++if get_ee_hooks() is None:
++    from src.routers import sso as sso_router_module  # noqa: E402
++
++    v1_router.include_router(sso_router_module.router, prefix="/auth/sso", tags=["sso", "auth"])
++
+ # Register EE Routers if available
+ register_ee_routers(v1_router)
+ 
+Index: b/lib/learnhouse/apps/api/src/tests/routers/test_plan_overview_router.py
+===================================================================
+--- a/lib/learnhouse/apps/api/src/tests/routers/test_plan_overview_router.py
++++ b/lib/learnhouse/apps/api/src/tests/routers/test_plan_overview_router.py
+@@ -276,8 +276,8 @@ class TestSelfHosted:
+         f = by_key(data)
+         assert (data["plan"], data["status"], data["billing"], data["next_plan"]) == ("oss", "community", "none", None)
+         assert data["poc"] is None and data["license"] is None
+-        assert f["sso"]["state"] == "edition" and f["sso"]["upgrade_plan"] is None
+-        assert f["boards"]["state"] == "edition"
++        assert f["sso"]["state"] == "included" and f["sso"]["upgrade_plan"] is None
++        assert f["boards"]["state"] == "edition" and f["boards"]["upgrade_plan"] is None
+         assert f["podcasts"]["state"] == "included" and f["podcasts"]["limit"] == 0
+         assert f["custom_domain"]["state"] == "included" and f["remove_watermark"]["state"] == "included"
+         assert f["courses"]["limit"] == 0
+Index: b/lib/learnhouse/docs/content/enterprise/sso/custom-oidc.mdx
+===================================================================
+--- a/lib/learnhouse/docs/content/enterprise/sso/custom-oidc.mdx
++++ b/lib/learnhouse/docs/content/enterprise/sso/custom-oidc.mdx
+@@ -44,7 +44,7 @@ Any OIDC-compliant provider works, inclu
+ ## Setup Steps
+ 
+ 1. Register LearnHouse as an application in your identity provider and get a client ID and client secret.
+-2. Set the redirect URI in your identity provider to LearnHouse's [callback URL](/enterprise/sso#callback-url), which ends in `/api/v1/auth/sso/callback`.
++2. Set the redirect URI in your identity provider to LearnHouse's [callback URL](/enterprise/sso#callback-url), which ends in `/auth/sso/callback`.
+ 3. In LearnHouse, go to **Developers** → **SSO** and choose **Custom OIDC** as the **SSO Provider**.
+ 4. Enter the **Issuer URL**, **Client ID** and **Client Secret**, and adjust **Scopes** if needed.
+ 5. Set **Enable SSO**, **Allowed Email Domains** and **Auto-provision Users** (see [SSO options](/enterprise/sso#setting-up-sso)) and click **Save Configuration**.
+@@ -53,3 +53,7 @@ Any OIDC-compliant provider works, inclu
+ <Callout type="info">
+ LearnHouse uses OIDC Discovery to find the authorization, token and userinfo endpoints from the issuer URL. Make sure your identity provider exposes a `/.well-known/openid-configuration` document.
+ </Callout>
++
++## Self-hosted identity providers
++
++LearnHouse reaches the identity provider over `https://` only, and refuses private and internal addresses so an issuer URL cannot be pointed at the instance's own network. If your provider runs on a private address, list its hostname in `LEARNHOUSE_SSO_TRUSTED_HOSTS` on the API (comma-separated, for example `auth.example.com`). Only SSO requests to those hosts skip the address check.
+Index: b/lib/learnhouse/docs/content/enterprise/sso/index.mdx
+===================================================================
+--- a/lib/learnhouse/docs/content/enterprise/sso/index.mdx
++++ b/lib/learnhouse/docs/content/enterprise/sso/index.mdx
+@@ -11,7 +11,7 @@ import { Callout } from '@/components/md
+ SSO lets members sign in to your organization through your company's identity provider. They use their work credentials and do not need a LearnHouse password.
+ 
+ <Callout>
+-SSO needs the Enterprise plan on LearnHouse Cloud, or the [Enterprise Edition](/enterprise) when self-hosted.
++SSO needs the Enterprise plan on LearnHouse Cloud. Self-hosted community builds include it.
+ <PlanCta plan="Enterprise" />
+ </Callout>
+ 
+@@ -61,8 +61,8 @@ With **Auto-provision Users** on, a memb
+ 
+ LearnHouse does **not** link an SSO identity to an existing account just because the email matches. An existing account is accepted only when:
+ 
+-- it was linked to this SSO identity before, or
+-- it has never signed in any other way and belongs only to this organization.
++- it has never signed in any other way and belongs only to this organization, or
++- it belongs only to this organization, its email is in one of the **Allowed Email Domains**, and the identity provider marks the address as verified (`email_verified: true`).
+ 
+ Otherwise the sign-in is refused, and the member is asked to sign in with their usual method. Backoffice accounts can never sign in through SSO.
+ 
+@@ -75,7 +75,7 @@ Members who sign in through SSO can be e
+ Your identity provider needs LearnHouse's callback URL:
+ 
+ ```
+-<base URL>/api/v1/auth/sso/callback
++<organization URL>/auth/sso/callback
+ ```
+ 
+-LearnHouse builds it from `SSO_REDIRECT_URI_BASE`, or from `LEARNHOUSE_DOMAIN` when that is not set. On a self-hosted instance, set `SSO_REDIRECT_URI_BASE` to the public URL of your instance, including `https://`. To use a completely different URL, set `SSO_REDIRECT_URI` to the full callback URL instead.
++The organization URL is its custom domain when it has one. Set `SSO_REDIRECT_URI_BASE` to use another public base URL, including `https://`, or `SSO_REDIRECT_URI` to the full callback URL.
+Index: b/lib/learnhouse/packages/sdk/openapi.json
+===================================================================
+--- a/lib/learnhouse/packages/sdk/openapi.json
++++ b/lib/learnhouse/packages/sdk/openapi.json
+@@ -38623,6 +38623,575 @@
+         }
+       }
+     },
++    "/api/v1/auth/sso/providers": {
++      "get": {
++        "tags": [
++          "sso",
++          "auth"
++        ],
++        "summary": "List available SSO providers",
++        "description": "List the supported SSO providers with their configuration fields. Requires org admin.",
++        "operationId": "list_sso_providers_api_v1_auth_sso_providers_get",
++        "parameters": [
++          {
++            "name": "org_id",
++            "in": "query",
++            "required": true,
++            "schema": {
++              "type": "integer",
++              "title": "Org Id"
++            }
++          }
++        ],
++        "responses": {
++          "200": {
++            "description": "Supported SSO providers with their metadata.",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "type": "array",
++                  "items": {
++                    "$ref": "#/components/schemas/SSOProviderInfo"
++                  },
++                  "title": "Response List Sso Providers Api V1 Auth Sso Providers Get"
++                }
++              }
++            }
++          },
++          "401": {
++            "description": "Authentication required"
++          },
++          "403": {
++            "description": "Caller lacks admin rights, or SSO is not enabled for the organization"
++          },
++          "404": {
++            "description": "Organization not found"
++          },
++          "422": {
++            "description": "Validation Error",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            }
++          }
++        }
++      }
++    },
++    "/api/v1/auth/sso/{org_id}/config": {
++      "get": {
++        "tags": [
++          "sso",
++          "auth"
++        ],
++        "summary": "Get SSO configuration",
++        "description": "The organization's SSO configuration, or null if none is set up. Secrets come back empty. Requires org admin.",
++        "operationId": "get_sso_config_api_v1_auth_sso__org_id__config_get",
++        "parameters": [
++          {
++            "name": "org_id",
++            "in": "path",
++            "required": true,
++            "schema": {
++              "type": "integer",
++              "title": "Org Id"
++            }
++          }
++        ],
++        "responses": {
++          "200": {
++            "description": "SSO connection if configured, otherwise null.",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "anyOf": [
++                    {
++                      "$ref": "#/components/schemas/SSOConnectionRead"
++                    },
++                    {
++                      "type": "null"
++                    }
++                  ],
++                  "title": "Response Get Sso Config Api V1 Auth Sso  Org Id  Config Get"
++                }
++              }
++            }
++          },
++          "401": {
++            "description": "Authentication required"
++          },
++          "403": {
++            "description": "Caller lacks admin rights, or SSO is not enabled for the organization"
++          },
++          "404": {
++            "description": "Organization not found"
++          },
++          "422": {
++            "description": "Validation Error",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            }
++          }
++        }
++      },
++      "post": {
++        "tags": [
++          "sso",
++          "auth"
++        ],
++        "summary": "Create SSO configuration",
++        "description": "Set up SSO for an organization with the chosen provider and its settings. Requires org admin.",
++        "operationId": "create_sso_config_api_v1_auth_sso__org_id__config_post",
++        "parameters": [
++          {
++            "name": "org_id",
++            "in": "path",
++            "required": true,
++            "schema": {
++              "type": "integer",
++              "title": "Org Id"
++            }
++          }
++        ],
++        "requestBody": {
++          "required": true,
++          "content": {
++            "application/json": {
++              "schema": {
++                "$ref": "#/components/schemas/SSOConnectionCreate"
++              }
++            }
++          }
++        },
++        "responses": {
++          "200": {
++            "description": "Newly created SSO connection.",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/SSOConnectionRead"
++                }
++              }
++            }
++          },
++          "401": {
++            "description": "Authentication required"
++          },
++          "403": {
++            "description": "Caller lacks admin rights, or SSO is not enabled for the organization"
++          },
++          "404": {
++            "description": "Organization not found"
++          },
++          "422": {
++            "description": "Validation Error",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            }
++          }
++        }
++      },
++      "put": {
++        "tags": [
++          "sso",
++          "auth"
++        ],
++        "summary": "Update SSO configuration",
++        "description": "Change an organization's SSO settings. An empty client secret keeps the stored one. Requires org admin.",
++        "operationId": "update_sso_config_api_v1_auth_sso__org_id__config_put",
++        "parameters": [
++          {
++            "name": "org_id",
++            "in": "path",
++            "required": true,
++            "schema": {
++              "type": "integer",
++              "title": "Org Id"
++            }
++          }
++        ],
++        "requestBody": {
++          "required": true,
++          "content": {
++            "application/json": {
++              "schema": {
++                "$ref": "#/components/schemas/SSOConnectionUpdate"
++              }
++            }
++          }
++        },
++        "responses": {
++          "200": {
++            "description": "Updated SSO connection.",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/SSOConnectionRead"
++                }
++              }
++            }
++          },
++          "401": {
++            "description": "Authentication required"
++          },
++          "403": {
++            "description": "Caller lacks admin rights, or SSO is not enabled for the organization"
++          },
++          "404": {
++            "description": "Organization not found"
++          },
++          "422": {
++            "description": "Validation Error",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            }
++          }
++        }
++      },
++      "delete": {
++        "tags": [
++          "sso",
++          "auth"
++        ],
++        "summary": "Delete SSO configuration",
++        "description": "Turn SSO off for an organization by removing its SSO connection. Requires org admin.",
++        "operationId": "delete_sso_config_api_v1_auth_sso__org_id__config_delete",
++        "parameters": [
++          {
++            "name": "org_id",
++            "in": "path",
++            "required": true,
++            "schema": {
++              "type": "integer",
++              "title": "Org Id"
++            }
++          }
++        ],
++        "responses": {
++          "200": {
++            "description": "SSO configuration deleted.",
++            "content": {
++              "application/json": {
++                "schema": {}
++              }
++            }
++          },
++          "401": {
++            "description": "Authentication required"
++          },
++          "403": {
++            "description": "Caller lacks admin rights, or SSO is not enabled for the organization"
++          },
++          "404": {
++            "description": "Organization not found"
++          },
++          "422": {
++            "description": "Validation Error",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            }
++          }
++        }
++      }
++    },
++    "/api/v1/auth/sso/{org_id}/setup-url": {
++      "get": {
++        "tags": [
++          "sso",
++          "auth"
++        ],
++        "summary": "Get provider setup URL",
++        "description": "The provider's admin portal URL for configuring the identity provider, for providers that have one (WorkOS). Requires org admin.",
++        "operationId": "get_setup_url_api_v1_auth_sso__org_id__setup_url_get",
++        "parameters": [
++          {
++            "name": "org_id",
++            "in": "path",
++            "required": true,
++            "schema": {
++              "type": "integer",
++              "title": "Org Id"
++            }
++          },
++          {
++            "name": "return_url",
++            "in": "query",
++            "required": true,
++            "schema": {
++              "type": "string",
++              "description": "URL to return to after setup",
++              "title": "Return Url"
++            },
++            "description": "URL to return to after setup"
++          }
++        ],
++        "responses": {
++          "200": {
++            "description": "Setup URL for the admin portal.",
++            "content": {
++              "application/json": {
++                "schema": {}
++              }
++            }
++          },
++          "400": {
++            "description": "No setup URL: SSO is not configured or the provider has no portal"
++          },
++          "401": {
++            "description": "Authentication required"
++          },
++          "403": {
++            "description": "Caller lacks admin rights, or SSO is not enabled for the organization"
++          },
++          "404": {
++            "description": "Organization not found"
++          },
++          "422": {
++            "description": "Validation Error",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            }
++          }
++        }
++      }
++    },
++    "/api/v1/auth/sso/check": {
++      "get": {
++        "tags": [
++          "sso",
++          "auth"
++        ],
++        "summary": "Check if SSO is enabled",
++        "description": "Whether the login page should show the SSO button for an organization.",
++        "operationId": "check_sso_api_v1_auth_sso_check_get",
++        "parameters": [
++          {
++            "name": "org_slug",
++            "in": "query",
++            "required": true,
++            "schema": {
++              "type": "string",
++              "description": "Organization slug",
++              "title": "Org Slug"
++            },
++            "description": "Organization slug"
++          }
++        ],
++        "responses": {
++          "200": {
++            "description": "Whether SSO is enabled for the organization.",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/SSOLoginCheckResponse"
++                }
++              }
++            }
++          },
++          "422": {
++            "description": "Validation Error",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            }
++          }
++        }
++      }
++    },
++    "/api/v1/auth/sso/authorize": {
++      "get": {
++        "tags": [
++          "sso",
++          "auth"
++        ],
++        "summary": "Initiate SSO login flow",
++        "description": "Start an SSO sign-in: the identity provider URL to send the browser to.",
++        "operationId": "authorize_sso_api_v1_auth_sso_authorize_get",
++        "parameters": [
++          {
++            "name": "org_slug",
++            "in": "query",
++            "required": true,
++            "schema": {
++              "type": "string",
++              "description": "Organization slug",
++              "title": "Org Slug"
++            },
++            "description": "Organization slug"
++          }
++        ],
++        "responses": {
++          "200": {
++            "description": "Authorization URL and state for the IdP redirect.",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/SSOAuthorizationResponse"
++                }
++              }
++            }
++          },
++          "400": {
++            "description": "SSO is not enabled for this organization"
++          },
++          "403": {
++            "description": "The organization does not allow signing in with SSO"
++          },
++          "404": {
++            "description": "SSO is not configured for this organization"
++          },
++          "422": {
++            "description": "Validation Error",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            }
++          }
++        }
++      }
++    },
++    "/api/v1/auth/sso/callback": {
++      "get": {
++        "tags": [
++          "sso",
++          "auth"
++        ],
++        "summary": "Handle SSO callback",
++        "description": "Finish an SSO sign-in: exchange the authorization code at the identity provider, resolve the account, set the session cookies and return the user with its tokens. With a confirmed second factor, no cookies are set and the body is {mfa_required: true, mfa_token} instead.",
++        "operationId": "sso_callback_api_v1_auth_sso_callback_get",
++        "parameters": [
++          {
++            "name": "code",
++            "in": "query",
++            "required": false,
++            "schema": {
++              "anyOf": [
++                {
++                  "type": "string"
++                },
++                {
++                  "type": "null"
++                }
++              ],
++              "description": "Authorization code from IdP",
++              "title": "Code"
++            },
++            "description": "Authorization code from IdP"
++          },
++          {
++            "name": "state",
++            "in": "query",
++            "required": false,
++            "schema": {
++              "anyOf": [
++                {
++                  "type": "string"
++                },
++                {
++                  "type": "null"
++                }
++              ],
++              "description": "State parameter for CSRF verification",
++              "title": "State"
++            },
++            "description": "State parameter for CSRF verification"
++          },
++          {
++            "name": "error",
++            "in": "query",
++            "required": false,
++            "schema": {
++              "anyOf": [
++                {
++                  "type": "string"
++                },
++                {
++                  "type": "null"
++                }
++              ],
++              "description": "Error code from IdP",
++              "title": "Error"
++            },
++            "description": "Error code from IdP"
++          },
++          {
++            "name": "error_description",
++            "in": "query",
++            "required": false,
++            "schema": {
++              "anyOf": [
++                {
++                  "type": "string"
++                },
++                {
++                  "type": "null"
++                }
++              ],
++              "description": "Error description from IdP",
++              "title": "Error Description"
++            },
++            "description": "Error description from IdP"
++          }
++        ],
++        "responses": {
++          "200": {
++            "description": "Signed-in user with tokens, or a second-factor challenge.",
++            "content": {
++              "application/json": {
++                "schema": {}
++              }
++            }
++          },
++          "400": {
++            "description": "The IdP returned an error, parameters are missing, or the state is invalid"
++          },
++          "401": {
++            "description": "The identity provider did not authenticate the user"
++          },
++          "403": {
++            "description": "The account may not sign in through this organization's SSO"
++          },
++          "422": {
++            "description": "Validation Error",
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            }
++          }
++        }
++      }
++    },
+     "/api/v1/tools": {
+       "get": {
+         "tags": [
+@@ -75528,6 +76097,301 @@
+         "type": "object",
+         "title": "RulesBody"
+       },
++      "SSOAuthorizationResponse": {
++        "properties": {
++          "authorization_url": {
++            "type": "string",
++            "title": "Authorization Url"
++          },
++          "state": {
++            "type": "string",
++            "title": "State"
++          }
++        },
++        "type": "object",
++        "required": [
++          "authorization_url",
++          "state"
++        ],
++        "title": "SSOAuthorizationResponse",
++        "description": "Response for SSO authorization initiation."
++      },
++      "SSOConnectionCreate": {
++        "properties": {
++          "provider": {
++            "type": "string",
++            "title": "Provider"
++          },
++          "enabled": {
++            "type": "boolean",
++            "title": "Enabled",
++            "default": false
++          },
++          "domains": {
++            "items": {
++              "type": "string"
++            },
++            "type": "array",
++            "title": "Domains",
++            "default": []
++          },
++          "auto_provision_users": {
++            "type": "boolean",
++            "title": "Auto Provision Users",
++            "default": true
++          },
++          "default_role_id": {
++            "anyOf": [
++              {
++                "type": "integer"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Default Role Id"
++          },
++          "provider_config": {
++            "anyOf": [
++              {
++                "additionalProperties": true,
++                "type": "object"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Provider Config"
++          }
++        },
++        "type": "object",
++        "required": [
++          "provider"
++        ],
++        "title": "SSOConnectionCreate",
++        "description": "Request model for creating SSO connection."
++      },
++      "SSOConnectionRead": {
++        "properties": {
++          "provider": {
++            "type": "string",
++            "title": "Provider"
++          },
++          "enabled": {
++            "type": "boolean",
++            "title": "Enabled",
++            "default": false
++          },
++          "domains": {
++            "items": {
++              "type": "string"
++            },
++            "type": "array",
++            "title": "Domains"
++          },
++          "auto_provision_users": {
++            "type": "boolean",
++            "title": "Auto Provision Users",
++            "default": true
++          },
++          "provider_config": {
++            "anyOf": [
++              {
++                "additionalProperties": true,
++                "type": "object"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Provider Config"
++          },
++          "id": {
++            "type": "integer",
++            "title": "Id"
++          },
++          "org_id": {
++            "type": "integer",
++            "title": "Org Id"
++          },
++          "default_role_id": {
++            "anyOf": [
++              {
++                "type": "integer"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Default Role Id"
++          },
++          "created_at": {
++            "type": "string",
++            "format": "date-time",
++            "title": "Created At"
++          },
++          "updated_at": {
++            "type": "string",
++            "format": "date-time",
++            "title": "Updated At"
++          }
++        },
++        "type": "object",
++        "required": [
++          "provider",
++          "id",
++          "org_id",
++          "created_at",
++          "updated_at"
++        ],
++        "title": "SSOConnectionRead",
++        "description": "Response model for SSO connection."
++      },
++      "SSOConnectionUpdate": {
++        "properties": {
++          "provider": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Provider"
++          },
++          "enabled": {
++            "anyOf": [
++              {
++                "type": "boolean"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Enabled"
++          },
++          "domains": {
++            "anyOf": [
++              {
++                "items": {
++                  "type": "string"
++                },
++                "type": "array"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Domains"
++          },
++          "auto_provision_users": {
++            "anyOf": [
++              {
++                "type": "boolean"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Auto Provision Users"
++          },
++          "default_role_id": {
++            "anyOf": [
++              {
++                "type": "integer"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Default Role Id"
++          },
++          "provider_config": {
++            "anyOf": [
++              {
++                "additionalProperties": true,
++                "type": "object"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Provider Config"
++          }
++        },
++        "type": "object",
++        "title": "SSOConnectionUpdate",
++        "description": "Request model for updating SSO connection."
++      },
++      "SSOLoginCheckResponse": {
++        "properties": {
++          "sso_enabled": {
++            "type": "boolean",
++            "title": "Sso Enabled"
++          },
++          "provider": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Provider"
++          }
++        },
++        "type": "object",
++        "required": [
++          "sso_enabled"
++        ],
++        "title": "SSOLoginCheckResponse",
++        "description": "Response for checking if SSO is available for an organization."
++      },
++      "SSOProviderInfo": {
++        "properties": {
++          "id": {
++            "type": "string",
++            "title": "Id"
++          },
++          "name": {
++            "type": "string",
++            "title": "Name"
++          },
++          "description": {
++            "type": "string",
++            "title": "Description"
++          },
++          "has_setup_portal": {
++            "type": "boolean",
++            "title": "Has Setup Portal"
++          },
++          "available": {
++            "type": "boolean",
++            "title": "Available"
++          },
++          "config_fields": {
++            "items": {
++              "additionalProperties": true,
++              "type": "object"
++            },
++            "type": "array",
++            "title": "Config Fields"
++          }
++        },
++        "type": "object",
++        "required": [
++          "id",
++          "name",
++          "description",
++          "has_setup_portal",
++          "available",
++          "config_fields"
++        ],
++        "title": "SSOProviderInfo",
++        "description": "Information about an available SSO provider."
++      },
+       "SaveActivityContentRequest": {
+         "properties": {
+           "activity_uuid": {
+Index: b/lib/learnhouse/packages/sdk/src/generated/schema.ts
+===================================================================
+--- a/lib/learnhouse/packages/sdk/src/generated/schema.ts
++++ b/lib/learnhouse/packages/sdk/src/generated/schema.ts
+@@ -11522,6 +11522,138 @@ export interface paths {
+         patch?: never;
+         trace?: never;
+     };
++    "/api/v1/auth/sso/providers": {
++        parameters: {
++            query?: never;
++            header?: never;
++            path?: never;
++            cookie?: never;
++        };
++        /**
++         * List available SSO providers
++         * @description List the supported SSO providers with their configuration fields. Requires org admin.
++         */
++        get: operations["list_sso_providers_api_v1_auth_sso_providers_get"];
++        put?: never;
++        post?: never;
++        delete?: never;
++        options?: never;
++        head?: never;
++        patch?: never;
++        trace?: never;
++    };
++    "/api/v1/auth/sso/{org_id}/config": {
++        parameters: {
++            query?: never;
++            header?: never;
++            path?: never;
++            cookie?: never;
++        };
++        /**
++         * Get SSO configuration
++         * @description The organization's SSO configuration, or null if none is set up. Secrets come back empty. Requires org admin.
++         */
++        get: operations["get_sso_config_api_v1_auth_sso__org_id__config_get"];
++        /**
++         * Update SSO configuration
++         * @description Change an organization's SSO settings. An empty client secret keeps the stored one. Requires org admin.
++         */
++        put: operations["update_sso_config_api_v1_auth_sso__org_id__config_put"];
++        /**
++         * Create SSO configuration
++         * @description Set up SSO for an organization with the chosen provider and its settings. Requires org admin.
++         */
++        post: operations["create_sso_config_api_v1_auth_sso__org_id__config_post"];
++        /**
++         * Delete SSO configuration
++         * @description Turn SSO off for an organization by removing its SSO connection. Requires org admin.
++         */
++        delete: operations["delete_sso_config_api_v1_auth_sso__org_id__config_delete"];
++        options?: never;
++        head?: never;
++        patch?: never;
++        trace?: never;
++    };
++    "/api/v1/auth/sso/{org_id}/setup-url": {
++        parameters: {
++            query?: never;
++            header?: never;
++            path?: never;
++            cookie?: never;
++        };
++        /**
++         * Get provider setup URL
++         * @description The provider's admin portal URL for configuring the identity provider, for providers that have one (WorkOS). Requires org admin.
++         */
++        get: operations["get_setup_url_api_v1_auth_sso__org_id__setup_url_get"];
++        put?: never;
++        post?: never;
++        delete?: never;
++        options?: never;
++        head?: never;
++        patch?: never;
++        trace?: never;
++    };
++    "/api/v1/auth/sso/check": {
++        parameters: {
++            query?: never;
++            header?: never;
++            path?: never;
++            cookie?: never;
++        };
++        /**
++         * Check if SSO is enabled
++         * @description Whether the login page should show the SSO button for an organization.
++         */
++        get: operations["check_sso_api_v1_auth_sso_check_get"];
++        put?: never;
++        post?: never;
++        delete?: never;
++        options?: never;
++        head?: never;
++        patch?: never;
++        trace?: never;
++    };
++    "/api/v1/auth/sso/authorize": {
++        parameters: {
++            query?: never;
++            header?: never;
++            path?: never;
++            cookie?: never;
++        };
++        /**
++         * Initiate SSO login flow
++         * @description Start an SSO sign-in: the identity provider URL to send the browser to.
++         */
++        get: operations["authorize_sso_api_v1_auth_sso_authorize_get"];
++        put?: never;
++        post?: never;
++        delete?: never;
++        options?: never;
++        head?: never;
++        patch?: never;
++        trace?: never;
++    };
++    "/api/v1/auth/sso/callback": {
++        parameters: {
++            query?: never;
++            header?: never;
++            path?: never;
++            cookie?: never;
++        };
++        /**
++         * Handle SSO callback
++         * @description Finish an SSO sign-in: exchange the authorization code at the identity provider, resolve the account, set the session cookies and return the user with its tokens. With a confirmed second factor, no cookies are set and the body is {mfa_required: true, mfa_token} instead.
++         */
++        get: operations["sso_callback_api_v1_auth_sso_callback_get"];
++        put?: never;
++        post?: never;
++        delete?: never;
++        options?: never;
++        head?: never;
++        patch?: never;
++        trace?: never;
++    };
+     "/api/v1/tools": {
+         parameters: {
+             query?: never;
+@@ -25524,6 +25656,135 @@ export interface components {
+             usergroup_id?: number | null;
+         };
+         /**
++         * SSOAuthorizationResponse
++         * @description Response for SSO authorization initiation.
++         */
++        SSOAuthorizationResponse: {
++            /** Authorization Url */
++            authorization_url: string;
++            /** State */
++            state: string;
++        };
++        /**
++         * SSOConnectionCreate
++         * @description Request model for creating SSO connection.
++         */
++        SSOConnectionCreate: {
++            /** Provider */
++            provider: string;
++            /**
++             * Enabled
++             * @default false
++             */
++            enabled?: boolean;
++            /**
++             * Domains
++             * @default []
++             */
++            domains?: string[];
++            /**
++             * Auto Provision Users
++             * @default true
++             */
++            auto_provision_users?: boolean;
++            /** Default Role Id */
++            default_role_id?: number | null;
++            /** Provider Config */
++            provider_config?: {
++                [key: string]: unknown;
++            } | null;
++        };
++        /**
++         * SSOConnectionRead
++         * @description Response model for SSO connection.
++         */
++        SSOConnectionRead: {
++            /** Provider */
++            provider: string;
++            /**
++             * Enabled
++             * @default false
++             */
++            enabled?: boolean;
++            /** Domains */
++            domains?: string[];
++            /**
++             * Auto Provision Users
++             * @default true
++             */
++            auto_provision_users?: boolean;
++            /** Provider Config */
++            provider_config?: {
++                [key: string]: unknown;
++            } | null;
++            /** Id */
++            id: number;
++            /** Org Id */
++            org_id: number;
++            /** Default Role Id */
++            default_role_id?: number | null;
++            /**
++             * Created At
++             * Format: date-time
++             */
++            created_at: string;
++            /**
++             * Updated At
++             * Format: date-time
++             */
++            updated_at: string;
++        };
++        /**
++         * SSOConnectionUpdate
++         * @description Request model for updating SSO connection.
++         */
++        SSOConnectionUpdate: {
++            /** Provider */
++            provider?: string | null;
++            /** Enabled */
++            enabled?: boolean | null;
++            /** Domains */
++            domains?: string[] | null;
++            /** Auto Provision Users */
++            auto_provision_users?: boolean | null;
++            /** Default Role Id */
++            default_role_id?: number | null;
++            /** Provider Config */
++            provider_config?: {
++                [key: string]: unknown;
++            } | null;
++        };
++        /**
++         * SSOLoginCheckResponse
++         * @description Response for checking if SSO is available for an organization.
++         */
++        SSOLoginCheckResponse: {
++            /** Sso Enabled */
++            sso_enabled: boolean;
++            /** Provider */
++            provider?: string | null;
++        };
++        /**
++         * SSOProviderInfo
++         * @description Information about an available SSO provider.
++         */
++        SSOProviderInfo: {
++            /** Id */
++            id: string;
++            /** Name */
++            name: string;
++            /** Description */
++            description: string;
++            /** Has Setup Portal */
++            has_setup_portal: boolean;
++            /** Available */
++            available: boolean;
++            /** Config Fields */
++            config_fields: {
++                [key: string]: unknown;
++            }[];
++        };
++        /**
+          * SaveActivityContentRequest
+          * @description Request to save AI-generated content to an activity
+          */
+@@ -60111,6 +60372,480 @@ export interface operations {
+                 headers: {
+                     [name: string]: unknown;
+                 };
++                content?: never;
++            };
++            /** @description Validation Error */
++            422: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["HTTPValidationError"];
++                };
++            };
++        };
++    };
++    list_sso_providers_api_v1_auth_sso_providers_get: {
++        parameters: {
++            query: {
++                org_id: number;
++            };
++            header?: never;
++            path?: never;
++            cookie?: never;
++        };
++        requestBody?: never;
++        responses: {
++            /** @description Supported SSO providers with their metadata. */
++            200: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["SSOProviderInfo"][];
++                };
++            };
++            /** @description Authentication required */
++            401: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
++            /** @description Caller lacks admin rights, or SSO is not enabled for the organization */
++            403: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
++            /** @description Organization not found */
++            404: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
++            /** @description Validation Error */
++            422: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["HTTPValidationError"];
++                };
++            };
++        };
++    };
++    get_sso_config_api_v1_auth_sso__org_id__config_get: {
++        parameters: {
++            query?: never;
++            header?: never;
++            path: {
++                org_id: number;
++            };
++            cookie?: never;
++        };
++        requestBody?: never;
++        responses: {
++            /** @description SSO connection if configured, otherwise null. */
++            200: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["SSOConnectionRead"] | null;
++                };
++            };
++            /** @description Authentication required */
++            401: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
++            /** @description Caller lacks admin rights, or SSO is not enabled for the organization */
++            403: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
++            /** @description Organization not found */
++            404: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
++            /** @description Validation Error */
++            422: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["HTTPValidationError"];
++                };
++            };
++        };
++    };
++    update_sso_config_api_v1_auth_sso__org_id__config_put: {
++        parameters: {
++            query?: never;
++            header?: never;
++            path: {
++                org_id: number;
++            };
++            cookie?: never;
++        };
++        requestBody: {
++            content: {
++                "application/json": components["schemas"]["SSOConnectionUpdate"];
++            };
++        };
++        responses: {
++            /** @description Updated SSO connection. */
++            200: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["SSOConnectionRead"];
++                };
++            };
++            /** @description Authentication required */
++            401: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
++            /** @description Caller lacks admin rights, or SSO is not enabled for the organization */
++            403: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
++            /** @description Organization not found */
++            404: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
++            /** @description Validation Error */
++            422: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["HTTPValidationError"];
++                };
++            };
++        };
++    };
++    create_sso_config_api_v1_auth_sso__org_id__config_post: {
++        parameters: {
++            query?: never;
++            header?: never;
++            path: {
++                org_id: number;
++            };
++            cookie?: never;
++        };
++        requestBody: {
++            content: {
++                "application/json": components["schemas"]["SSOConnectionCreate"];
++            };
++        };
++        responses: {
++            /** @description Newly created SSO connection. */
++            200: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["SSOConnectionRead"];
++                };
++            };
++            /** @description Authentication required */
++            401: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
++            /** @description Caller lacks admin rights, or SSO is not enabled for the organization */
++            403: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
++            /** @description Organization not found */
++            404: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
++            /** @description Validation Error */
++            422: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["HTTPValidationError"];
++                };
++            };
++        };
++    };
++    delete_sso_config_api_v1_auth_sso__org_id__config_delete: {
++        parameters: {
++            query?: never;
++            header?: never;
++            path: {
++                org_id: number;
++            };
++            cookie?: never;
++        };
++        requestBody?: never;
++        responses: {
++            /** @description SSO configuration deleted. */
++            200: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": unknown;
++                };
++            };
++            /** @description Authentication required */
++            401: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
++            /** @description Caller lacks admin rights, or SSO is not enabled for the organization */
++            403: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
++            /** @description Organization not found */
++            404: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
++            /** @description Validation Error */
++            422: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["HTTPValidationError"];
++                };
++            };
++        };
++    };
++    get_setup_url_api_v1_auth_sso__org_id__setup_url_get: {
++        parameters: {
++            query: {
++                /** @description URL to return to after setup */
++                return_url: string;
++            };
++            header?: never;
++            path: {
++                org_id: number;
++            };
++            cookie?: never;
++        };
++        requestBody?: never;
++        responses: {
++            /** @description Setup URL for the admin portal. */
++            200: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": unknown;
++                };
++            };
++            /** @description No setup URL: SSO is not configured or the provider has no portal */
++            400: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
++            /** @description Authentication required */
++            401: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
++            /** @description Caller lacks admin rights, or SSO is not enabled for the organization */
++            403: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
++            /** @description Organization not found */
++            404: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
++            /** @description Validation Error */
++            422: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["HTTPValidationError"];
++                };
++            };
++        };
++    };
++    check_sso_api_v1_auth_sso_check_get: {
++        parameters: {
++            query: {
++                /** @description Organization slug */
++                org_slug: string;
++            };
++            header?: never;
++            path?: never;
++            cookie?: never;
++        };
++        requestBody?: never;
++        responses: {
++            /** @description Whether SSO is enabled for the organization. */
++            200: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["SSOLoginCheckResponse"];
++                };
++            };
++            /** @description Validation Error */
++            422: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["HTTPValidationError"];
++                };
++            };
++        };
++    };
++    authorize_sso_api_v1_auth_sso_authorize_get: {
++        parameters: {
++            query: {
++                /** @description Organization slug */
++                org_slug: string;
++            };
++            header?: never;
++            path?: never;
++            cookie?: never;
++        };
++        requestBody?: never;
++        responses: {
++            /** @description Authorization URL and state for the IdP redirect. */
++            200: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["SSOAuthorizationResponse"];
++                };
++            };
++            /** @description SSO is not enabled for this organization */
++            400: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
++            /** @description The organization does not allow signing in with SSO */
++            403: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
++            /** @description SSO is not configured for this organization */
++            404: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
++            /** @description Validation Error */
++            422: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": components["schemas"]["HTTPValidationError"];
++                };
++            };
++        };
++    };
++    sso_callback_api_v1_auth_sso_callback_get: {
++        parameters: {
++            query?: {
++                /** @description Authorization code from IdP */
++                code?: string | null;
++                /** @description State parameter for CSRF verification */
++                state?: string | null;
++                /** @description Error code from IdP */
++                error?: string | null;
++                /** @description Error description from IdP */
++                error_description?: string | null;
++            };
++            header?: never;
++            path?: never;
++            cookie?: never;
++        };
++        requestBody?: never;
++        responses: {
++            /** @description Signed-in user with tokens, or a second-factor challenge. */
++            200: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content: {
++                    "application/json": unknown;
++                };
++            };
++            /** @description The IdP returned an error, parameters are missing, or the state is invalid */
++            400: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
++            /** @description The identity provider did not authenticate the user */
++            401: {
++                headers: {
++                    [name: string]: unknown;
++                };
++                content?: never;
++            };
++            /** @description The account may not sign in through this organization's SSO */
++            403: {
++                headers: {
++                    [name: string]: unknown;
++                };
+                 content?: never;
+             };
+             /** @description Validation Error */
+Index: b/lib/learnhouse/apps/web/app/auth/login/login.tsx
+===================================================================
+--- a/lib/learnhouse/apps/web/app/auth/login/login.tsx
++++ b/lib/learnhouse/apps/web/app/auth/login/login.tsx
+@@ -258,11 +258,12 @@ const LoginClient = (props: LoginClientP
+         setSsoEnabled(false)
+         return
+       }
+-      // SSO comes with the Business and Enterprise plans (or EE)
++      // SSO comes with the Business and Enterprise plans on SaaS; self-hosted
++      // builds ask the API whether the org has it set up.
+       const orgConfig = props.org?.config?.config
+       const plan = orgConfig?.plan ?? orgConfig?.cloud?.plan
+       const mode = getDeploymentMode()
+-      if (mode === 'oss' || (mode === 'saas' && plan !== 'business' && plan !== 'enterprise')) {
++      if (mode === 'saas' && plan !== 'business' && plan !== 'enterprise') {
+         setSsoEnabled(false)
+         return
+       }
+Index: b/lib/learnhouse/apps/web/app/orgs/[orgslug]/dash/developers/layout.tsx
+===================================================================
+--- a/lib/learnhouse/apps/web/app/orgs/[orgslug]/dash/developers/layout.tsx
++++ b/lib/learnhouse/apps/web/app/orgs/[orgslug]/dash/developers/layout.tsx
+@@ -15,7 +15,7 @@ import {
+   ShieldCheck,
+   Terminal,
+ } from '@phosphor-icons/react'
+-import { getUriWithOrg } from '@services/config/config'
++import { getDeploymentMode, getUriWithOrg } from '@services/config/config'
+ import { Breadcrumbs } from '@components/Objects/Breadcrumbs/Breadcrumbs'
+ import { DashTabBar, DashTabItem } from '@components/Dashboard/Shared/DashTabBar/DashTabBar'
+ import { buttonClass } from '@components/Dashboard/Shared/DashKit/DashKit'
+@@ -94,7 +94,8 @@ const getDevTabs = (t: any): TabConfig[]
+     id: 'sso',
+     label: t('dashboard.organization.settings.tabs.sso', { defaultValue: 'SSO' }),
+     icon: <ShieldCheck size={16} />,
+-    requiredPlan: 'business',
++    // Self-hosted community builds include SSO.
++    requiredPlan: getDeploymentMode() === 'saas' ? 'business' : undefined,
+     title: t('dashboard.organization.settings.pages.sso.title', { defaultValue: 'Single Sign-On' }),
+     subtitle: t('dashboard.organization.settings.pages.sso.subtitle', { defaultValue: 'Configure SSO for your organization' }),
+   },
+Index: b/lib/learnhouse/apps/web/services/plans/plans.ts
+===================================================================
+--- a/lib/learnhouse/apps/web/services/plans/plans.ts
++++ b/lib/learnhouse/apps/web/services/plans/plans.ts
+@@ -23,7 +23,7 @@ export type PlanLevel = 'free' | 'person
+ export const PLAN_HIERARCHY: PlanLevel[] = ['free', 'personal', 'personal-family', 'standard', 'pro', 'business', 'enterprise']
+ 
+ // Features blocked in OSS mode; they require EE or SaaS/enterprise plan
+-const OSS_BLOCKED_FEATURES = new Set(['sso', 'audit_logs', 'payments', 'analytics_advanced', 'scorm', 'lti', 'xapi', 'live_sessions', 'scim', 'required_training', 'newsletter'])
++const OSS_BLOCKED_FEATURES = new Set(['audit_logs', 'payments', 'analytics_advanced', 'scorm', 'lti', 'xapi', 'live_sessions', 'scim', 'required_training', 'newsletter'])
+ 
+ /**
+  * Check if the current plan meets or exceeds the required plan level.
+Index: b/lib/learnhouse/apps/api/src/tests/security/test_feature_resolve.py
+===================================================================
+--- a/lib/learnhouse/apps/api/src/tests/security/test_feature_resolve.py
++++ b/lib/learnhouse/apps/api/src/tests/security/test_feature_resolve.py
+@@ -219,7 +219,8 @@ class TestFeatureResolve:
+             ee_disabled = resolve_feature("analytics", config, org_id=0)
+ 
+         with patch("src.security.features_utils.resolve.get_deployment_mode", return_value="oss"):
+-            oss_blocked = resolve_feature("sso", config, org_id=0)
++            oss_blocked = resolve_feature("scorm", config, org_id=0)
++            oss_sso = resolve_feature("sso", config, org_id=0)
+             oss_allowed = resolve_feature("analytics", config_allowed, org_id=0)
+ 
+         # EE: available (everything is), but the admin toggle still turned it off.
+@@ -240,6 +241,8 @@ class TestFeatureResolve:
+             "disabled_by": None,
+             "upgrade_plan": "enterprise",
+         }
++        # OSS: SSO ships in the community build.
++        assert oss_sso["enabled"] is True and oss_sso["available"] is True
+         assert oss_allowed == {
+             "enabled": True,
+             "available": True,

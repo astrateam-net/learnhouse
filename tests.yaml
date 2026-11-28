@@ -11,6 +11,9 @@ fileExistenceTests:
   - name: API source
     path: /app/api/src/services/courses/activities/video.py
     shouldExist: true
+  - name: Community SSO router
+    path: /app/api/src/routers/sso.py
+    shouldExist: true
 
 commandTests:
   - name: API accepts Kinescope external videos
@@ -25,6 +28,14 @@ commandTests:
     command: grep
     args: ["-q", "\"kinescope\": \"https://kinescope.io/", "/app/api/src/services/ai/tools/embeds.py"]
     exitCode: 0
+  - name: API mounts SSO at /auth/sso
+    command: grep
+    args: ["-q", "prefix=\"/auth/sso\"", "/app/api/src/router.py"]
+    exitCode: 0
+  - name: SSO is not an Enterprise-only feature
+    command: grep
+    args: ["-q", "'sso', 'audit_logs'", "/app/api/src/core/deployment_mode.py"]
+    exitCode: 1
   - name: web bundle carries the Kinescope player
     command: sh
     args: ["-c", "grep -rlq 'player.kinescope.io/latest/iframe.player.js' /app/web/.next/static"]
