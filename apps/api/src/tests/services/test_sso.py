@@ -320,11 +320,26 @@ async def test_callback_sets_the_session(db, client, connection):
     assert JWT_COOKIE_NAME in r.cookies
 
 
+async def test_idp_second_factor_counts_when_the_org_exempts_sso(db, client, connection):
+    auth = await svc.initiate_sso_login("test-org", db)
+    with patch.object(CustomOIDCProvider, "handle_callback", new=AsyncMock(return_value=profile())), patch(
+        "src.services.auth.session.is_mfa_active", new=AsyncMock(return_value=True)
+    ):
+        r = await client.get("/api/v1/auth/sso/callback", params={"code": "c", "state": auth.state})
+    assert r.status_code == 200, r.text
+    assert "mfa_required" not in r.json() and r.json()["tokens"]["access_token"]
+    assert JWT_COOKIE_NAME in r.cookies
+
+
 async def test_callback_with_a_second_factor_sets_no_session(db, client, connection):
     from src.services.auth.session import SessionIssueResult
+    from src.services.orgs.mfa_policy import OrgMFAPolicy
 
     auth = await svc.initiate_sso_login("test-org", db)
     with patch.object(CustomOIDCProvider, "handle_callback", new=AsyncMock(return_value=profile())), patch(
+        "src.services.orgs.mfa_policy.get_org_mfa_policy",
+        new=AsyncMock(return_value=OrgMFAPolicy(exempt_external_auth=False)),
+    ), patch(
         "src.services.auth.session.issue_session_or_challenge",
         new=AsyncMock(return_value=SessionIssueResult(mfa_required=True, mfa_token="pending")),
     ):
