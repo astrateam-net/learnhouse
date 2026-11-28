@@ -127,7 +127,7 @@ Index: b/lib/learnhouse/docs/content/enterprise/sso/index.mdx
  <PlanCta plan="Enterprise" />
  </Callout>
  
-@@ -61,8 +61,8 @@ With **Auto-provision Users** on, a memb
+@@ -61,10 +61,10 @@ With **Auto-provision Users** on, a memb
  
  LearnHouse does **not** link an SSO identity to an existing account just because the email matches. An existing account is accepted only when:
  
@@ -136,8 +136,11 @@ Index: b/lib/learnhouse/docs/content/enterprise/sso/index.mdx
 +- it has never signed in any other way and belongs only to this organization, or
 +- it belongs only to this organization, its email is in one of the **Allowed Email Domains**, and the identity provider marks the address as verified (`email_verified: true`).
  
- Otherwise the sign-in is refused, and the member is asked to sign in with their usual method. Backoffice accounts can never sign in through SSO.
+-Otherwise the sign-in is refused, and the member is asked to sign in with their usual method. Backoffice accounts can never sign in through SSO.
++Otherwise the sign-in is refused, and the member is asked to sign in with their usual method. On an instance that hosts several organizations, Backoffice accounts never sign in through SSO.
  
+ <Callout type="info">
+ Members who sign in through SSO can be exempted from your two-factor requirement, since the identity provider handles it. See [Two-Factor Authentication](/platform/users/two-factor#requiring-2fa-in-your-organization).
 @@ -75,7 +75,7 @@ Members who sign in through SSO can be e
  Your identity provider needs LearnHouse's callback URL:
  

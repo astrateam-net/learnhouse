@@ -265,13 +265,25 @@ async def test_a_domain_outside_the_list_is_refused(db, mock_request, connection
     assert e.value.detail["error_code"] == "email_domain_rejected"
 
 
-async def test_backoffice_staff_never_sign_in_through_an_org(db, mock_request, connection):
+async def test_backoffice_staff_never_sign_in_through_an_org_of_a_multi_org_instance(db, mock_request, connection):
     await make_user(db, 506, "ada@example.com")
     await join(db, 506, connection.org_id)
-    with patch("src.security.backoffice.is_user_backoffice_staff", new=AsyncMock(return_value=True)):
+    with patch("src.security.backoffice.is_user_backoffice_staff", new=AsyncMock(return_value=True)), patch(
+        "src.services.sso.sso._multi_tenant", return_value=True
+    ):
         with pytest.raises(HTTPException) as e:
             await sign_in(db, mock_request, profile())
     assert e.value.detail["error_code"] == "platform_sign_in_required"
+
+
+async def test_single_tenancy_admin_signs_in_through_sso(db, mock_request, connection):
+    await make_user(db, 507, "ada@example.com")
+    await join(db, 507, connection.org_id, role_id=1)
+    with patch("src.security.backoffice.is_user_backoffice_staff", new=AsyncMock(return_value=True)), patch(
+        "src.services.sso.sso._multi_tenant", return_value=False
+    ):
+        result = await sign_in(db, mock_request, profile())
+    assert result["user"].id == 507
 
 
 async def test_disabled_connection_is_not_offered(db, connection):
