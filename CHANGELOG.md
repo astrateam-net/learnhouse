@@ -19,6 +19,21 @@ upstream commit on its own line under the heading.
 
 LearnHouse 1.4.5 at learnhouse/learnhouse@57abad4 (dev)
 
+### Added
+
+- Single sign-on with OpenID Connect (and WorkOS, untested) in the community
+  build: the API side LearnHouse moved into its Enterprise Edition, restored
+  from its last public version and moved onto today's sign-in path (two-factor,
+  session provenance, custom domains). The web app's SSO settings, button and
+  callback page are no longer hidden.
+- An existing account signs in through SSO when SSO created it, or when it
+  belongs to this organization alone, its email is in an allowed domain and
+  the identity provider marks it verified. Backoffice accounts never do.
+
+## 4.5.1 - 2026-11-28
+
+LearnHouse 1.4.5 at learnhouse/learnhouse@57abad4 (dev)
+
 ### Changed
 
 - Rebased on upstream dev, which adds a video provider extension point
