@@ -369,3 +369,39 @@ def test_community_build_mounts_sso():
 
     mounted = [getattr(route, "original_router", None) for route in v1_router.routes]
     assert any(router is sso_router for router in mounted)
+
+
+async def test_sign_in_returns_to_next(db, client, connection):
+    consent = "/oauth/consent?client_id=c1&state=s1"
+    r = await client.get("/api/v1/auth/sso/authorize", params={"org_slug": "test-org", "next": consent})
+    assert r.status_code == 200, r.text
+    with patch.object(CustomOIDCProvider, "handle_callback", new=AsyncMock(return_value=profile())):
+        r = await client.get("/api/v1/auth/sso/callback", params={"code": "c", "state": r.json()["state"]})
+    assert r.status_code == 200, r.text
+    target = urlsplit(r.json()["redirect_url"])
+    assert target.path == "/redirect_from_auth"
+    assert parse_qs(target.query)["next"] == [consent]
+
+
+@pytest.mark.parametrize("next_path", ["//evil.example/x", "https://evil.example/x", "/\\evil.example", "relative"])
+def test_only_same_origin_paths_are_kept(next_path):
+    assert svc.safe_next_path(next_path) is None
+
+
+async def test_without_next_the_sign_in_lands_on_the_default(db, client, connection):
+    auth = await svc.initiate_sso_login("test-org", db)
+    with patch.object(CustomOIDCProvider, "handle_callback", new=AsyncMock(return_value=profile())):
+        r = await client.get("/api/v1/auth/sso/callback", params={"code": "c", "state": auth.state})
+    assert r.json()["redirect_url"] == "https://lms.example.test/redirect_from_auth"
+
+
+async def test_a_callback_only_finishes_in_the_browser_that_started_it(db, client, connection):
+    r = await client.get("/api/v1/auth/sso/authorize", params={"org_slug": "test-org"})
+    cookie = r.headers["set-cookie"]
+    assert "LH_sso_state=" in cookie and "HttpOnly" in cookie and "Path=/api/v1/auth/sso" in cookie
+    state = r.json()["state"]
+    other = AsyncClient(transport=client._transport, base_url="https://lms.example.test")
+    with patch.object(CustomOIDCProvider, "handle_callback", new=AsyncMock(return_value=profile())):
+        r = await other.get("/api/v1/auth/sso/callback", params={"code": "c", "state": state})
+    await other.aclose()
+    assert r.status_code == 400 and r.json()["detail"]["error_code"] == "state_not_bound"

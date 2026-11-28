@@ -4,7 +4,9 @@ SSO (Single Sign-On) API endpoints.
 Provides endpoints for SSO configuration (admin) and authentication (public).
 """
 
+import secrets
 from typing import Optional
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel
@@ -43,6 +45,8 @@ from src.services.sso.sso import is_sso_feature_enabled
 router = APIRouter()
 
 SECRET_CONFIG_KEYS = ("client_secret",)
+STATE_COOKIE = "LH_sso_state"
+STATE_COOKIE_PATH = "/api/v1/auth/sso"
 
 
 async def verify_org_admin_and_sso_feature(
@@ -269,10 +273,22 @@ async def check_sso(
 )
 async def authorize_sso(
     *,
+    request: Request,
+    response: Response,
     org_slug: str = Query(..., description="Organization slug"),
+    next: Optional[str] = Query(None, max_length=512, description="Same-origin path to land on after sign-in"),
     db_session: AsyncSession = Depends(get_db_session),
 ):
-    return await initiate_sso_login(org_slug, db_session)
+    from src.routers.auth import is_request_secure
+    from src.services.sso.sso import SSO_STATE_TTL_SECONDS
+
+    binding = secrets.token_urlsafe(32)
+    result = await initiate_sso_login(org_slug, db_session, next, binding)
+    response.set_cookie(
+        STATE_COOKIE, binding, max_age=SSO_STATE_TTL_SECONDS, path=STATE_COOKIE_PATH,
+        httponly=True, secure=is_request_secure(request), samesite="lax",
+    )
+    return result
 
 
 class SSOErrorResponse(BaseModel):
@@ -337,10 +353,13 @@ async def sso_callback(
             },
         )
 
-    result = await handle_sso_callback(request, code, state, db_session)
+    result = await handle_sso_callback(request, code, state, db_session, request.cookies.get(STATE_COOKIE))
+    response.delete_cookie(STATE_COOKIE, path=STATE_COOKIE_PATH)
     user = result["user"]
     org_id = result["org_id"]
     redirect_url = f"{await org_base_url(result['org_slug'], db_session, org_id)}/redirect_from_auth"
+    if result["next"]:
+        redirect_url += f"?next={quote(result['next'], safe='')}"
 
     session_org_id, on_custom_domain = await _bind_session_to_custom_domain(
         request, db_session, user.id, org_id, AUTH_METHOD_SSO

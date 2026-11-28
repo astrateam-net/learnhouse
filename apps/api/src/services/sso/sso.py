@@ -5,6 +5,7 @@ Handles SSO connection management, login initiation, callback processing,
 and user provisioning across different SSO providers.
 """
 
+import hmac
 import json
 import logging
 import os
@@ -286,9 +287,20 @@ async def check_sso_enabled(
     return {"sso_enabled": True, "provider": connection.provider}
 
 
+def safe_next_path(next_path: Optional[str]) -> Optional[str]:
+    """A same-origin path to land on after sign-in, or None."""
+    if not next_path or len(next_path) > 512:
+        return None
+    if not next_path.startswith("/") or next_path.startswith("//") or "\\" in next_path:
+        return None
+    return next_path
+
+
 async def initiate_sso_login(
     org_slug: str,
-    db_session: AsyncSession
+    db_session: AsyncSession,
+    next_path: Optional[str] = None,
+    binding: Optional[str] = None,
 ) -> SSOAuthorizationResponse:
     """Start an SSO sign-in: the IdP URL to send the browser to."""
     org = await _org_by_slug(org_slug, db_session)
@@ -327,6 +339,8 @@ async def initiate_sso_login(
         "org_slug": org.slug,
         "provider": connection.provider,
         "redirect_uri": redirect_uri,
+        "next": safe_next_path(next_path),
+        "binding": binding,
     })
     return SSOAuthorizationResponse(authorization_url=authorization_url, state=state)
 
@@ -360,7 +374,8 @@ async def handle_sso_callback(
     request: Request,
     code: str,
     state: str,
-    db_session: AsyncSession
+    db_session: AsyncSession,
+    binding: Optional[str] = None,
 ) -> dict:
     """Finish an SSO sign-in: the account it lands on and its organization."""
     state_data = _pop_state(state)
@@ -368,6 +383,16 @@ async def handle_sso_callback(
         raise _sso_error(
             400, "invalid_state", "state_invalid_or_expired",
             "The SSO session has expired or is invalid. Please try logging in again.",
+            provider=None,
+        )
+
+    # The state only finishes a sign-in in the browser that started it, so a
+    # callback link with someone else's code cannot sign the reader in as them.
+    expected = state_data.get("binding")
+    if expected and not (binding and hmac.compare_digest(binding, expected)):
+        raise _sso_error(
+            400, "invalid_state", "state_not_bound",
+            "This sign-in was started in another browser. Please try logging in again.",
             provider=None,
         )
 
@@ -427,7 +452,12 @@ async def handle_sso_callback(
         )
 
     user = await find_or_create_sso_user(request, profile, connection, db_session)
-    return {"user": user, "org_id": org_id, "org_slug": state_data["org_slug"]}
+    return {
+        "user": user,
+        "org_id": org_id,
+        "org_slug": state_data["org_slug"],
+        "next": safe_next_path(state_data.get("next")),
+    }
 
 
 async def find_or_create_sso_user(
